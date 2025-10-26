@@ -1,1 +1,1 @@
-# analyze-local-fastq-app
+analyze-fastq-app
