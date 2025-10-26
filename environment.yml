@@ -1,4 +1,4 @@
-name: auto-app2-env
+name: analyze-env
 channels:
   - bioconda
   - conda-forge
