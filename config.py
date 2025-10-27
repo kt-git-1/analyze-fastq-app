@@ -36,7 +36,7 @@ class PipelineConfig:
         # defaults to ``equCab3.fa`` as before.
         self.reference_genome: Path = (
             args.reference_genome
-            or (self.base_dir / "reference" / "equCab3.fa")
+            or (self.base_dir / "reference" / "equCab3.nochrUn.fa")
         )
 
         # Optional directory containing pre‑downloaded FASTQ files. When
