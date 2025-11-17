@@ -1,14 +1,22 @@
 import re
 import sys
+import shlex
 import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 from tqdm import tqdm
 
-from config import PipelineConfig, parse_args, setup_logging
+from config import (
+    PipelineConfig,
+    parse_args,
+    setup_logging,
+    cleanup_intermediate_file,
+    parse_fastq_general,
+    merge_lanes_by_cat,
+)
 from modules.ena_downloader import ENADownloader
 from modules.bwa_mapper import BWAMapper
 from modules.softclipper import SoftClipper
@@ -20,112 +28,39 @@ from modules.analyzers import (
 )
 
 
-def _cleanup_intermediate_file(path: Path, logger: logging.Logger) -> None:
-    """
-    Remove an intermediate file if it exists.  Failures to remove
-    intermediate files should not halt the pipeline, hence any
-    exceptions are caught and logged as warnings.
-
-    Parameters
-    ----------
-    path : Path
-        Path to the file to remove.
-    logger : logging.Logger
-        Logger for status reporting.
-    """
-    if not path:
-        return
-    try:
-        if path.exists():
-            path.unlink()
-            logger.info(f"Removed intermediate file: {path}")
-    except Exception as exc:
-        logger.warning(f"Failed to remove intermediate file {path}: {exc}")
-
-
-def parse_local_fastq(directory: Path) -> Dict[str, List[Path]]:
-    """
-    Discover paired FASTQ files within a directory based on Illumina
-    naming conventions.  Files are grouped by the common prefix
-    preceding the ``_R1_001.fastq.gz`` or ``_R2_001.fastq.gz`` suffix.
-
-    The grouping logic assumes that paired reads share the same lane
-    (``L###``) and sample identifiers, differing only by the ``R1`` or
-    ``R2`` read indicator.  For example, ``PE-AncientHorses-01_S1_L001_R1_001.fastq.gz``
-    and ``PE-AncientHorses-01_S1_L001_R2_001.fastq.gz`` constitute a
-    pair, while ``PE-AncientHorses-01_S1_L002_R1_001.fastq.gz`` and
-    ``PE-AncientHorses-01_S1_L002_R2_001.fastq.gz`` form another pair.
-
-    Parameters
-    ----------
-    directory : Path
-        Directory containing FASTQ files.
-
-    Returns
-    -------
-    Dict[str, List[Path]]
-        Mapping from a sample identifier (derived from the filename
-        prefix) to a list of one or two FASTQ files. The order within
-        each list is ``[R1, R2]`` when both reads are present, or
-        ``[R1]`` when only a single‑end read is available.
-    """
-    sample_to_files: Dict[str, Dict[str, Path]] = {}
-    pattern = re.compile(r"(.+)_R([12])_001\.fastq\.gz$")
-    for fastq in directory.glob("*.fastq.gz"):
-        match = pattern.match(fastq.name)
-        if not match:
-            # Skip files that do not follow the expected naming scheme
-            continue
-        prefix, read_number = match.groups()
-        entry = sample_to_files.setdefault(prefix, {})
-        if read_number == "1":
-            entry["R1"] = fastq
-        elif read_number == "2":
-            entry["R2"] = fastq
-    result: Dict[str, List[Path]] = {}
-    for prefix, reads in sample_to_files.items():
-        # Ensure deterministic ordering: R1 first, then R2 if present
-        ordered: List[Path] = []
-        if "R1" in reads:
-            ordered.append(reads["R1"])
-        if "R2" in reads:
-            ordered.append(reads["R2"])
-        result[prefix] = ordered
-    return result
-
+# ============================================================
+# メインパイプライン
+# ============================================================
 
 def main() -> None:
     """
-    Entry point for the complete NGS analysis pipeline.  Depending on
-    user input, this function either downloads reads from ENA or
-    processes pre‑downloaded FASTQ files from a local directory.  For
-    each sample or lane, the pipeline performs adapter trimming,
-    mapping, soft clipping, BAM processing, quality control analyses,
-    and variant calling.  Intermediate files are cleaned up after
-    downstream analyses complete successfully.
+    NGS解析パイプライン全体のエントリポイント。
+    ユーザーの入力に応じて、この関数はENAからリードデータをダウンロードするか、
+    またはローカルディレクトリ内の事前ダウンロード済みFASTQファイルを処理します。
     """
-    # Initialise configuration and logging
+    # 1. 設定とロギングを初期化
     args = parse_args()
     config = PipelineConfig(args)
     log_file = config.logs_dir / f"pipeline_{config.project_accession}.log"
     logger = setup_logging(log_file=log_file)
 
     logger.info(
-        f"Starting complete pipeline for project {config.project_accession}"
+        "解析パイプラインを開始します: project_accession=%s",
+        config.project_accession,
     )
 
-    # Verify presence of the reference genome
+    # 2. リファレンスゲノムの存在を確認
     if not config.reference_genome.exists():
-        logger.error(f"Reference genome not found: {config.reference_genome}")
+        logger.error("リファレンスゲノムが見つかりません: %s", config.reference_genome)
         sys.exit(1)
 
-    # Build reference index if missing
+    # 3. リファレンスゲノムのインデックスを作成
     fai = config.reference_genome.with_suffix(".fai")
     if not fai.exists():
-        logger.info("Creating reference genome index")
+        logger.info("リファレンスゲノムのインデックスを作成します")
         subprocess.run(["samtools", "faidx", str(config.reference_genome)], check=True)
 
-    # Instantiate modules
+    # 4. モジュールをインスタンス化
     ena_downloader = ENADownloader(config)
     bwa_mapper = BWAMapper(config)
     softclipper = SoftClipper(config)
@@ -136,87 +71,131 @@ def main() -> None:
 
     session = requests.Session()
 
-    # Determine data source: either ENA or local FASTQ directory
+    # 5. データソースを決定: ENAからのダウンロードか、ローカルのFASTQディレクトリ
     if config.fastq_dir:
-        # Local FASTQ processing
+        # 6. ローカルのFASTQディレクトリを処理
         if not config.fastq_dir.exists() or not config.fastq_dir.is_dir():
             logger.error(
-                f"Specified FASTQ directory does not exist or is not a directory: {config.fastq_dir}"
+                "指定されたFASTQディレクトリが存在しないか、ディレクトリではありません: %s",
+                config.fastq_dir,
             )
             sys.exit(1)
-        logger.info(f"Using local FASTQ files from: {config.fastq_dir}")
-        sample_to_fastqs = parse_local_fastq(config.fastq_dir)
+
+        logger.info("ローカルのFASTQファイルを使用します: %s", config.fastq_dir)
+
+        # ★ 6-1. いろいろな命名パターンをまとめてパース
+        sample_to_reads = parse_fastq_general(config.fastq_dir)
+
+        if not sample_to_reads:
+            logger.error("FASTQファイルが見つかりませんでした: %s", config.fastq_dir)
+            sys.exit(1)
+
+        # ★ 6-2. レーンをマージ（複数レーンがあれば cat、1ファイルならそのまま）
+        merged_dir = config.results_dir / "merged_fastq"
+        sample_to_fastqs = merge_lanes_by_cat(sample_to_reads, merged_dir, logger)
+
     else:
-        # Download from ENA as before
-        logger.info("Step 1: Downloading data from ENA")
+        # 7. ENAからデータをダウンロード
+        logger.info("ENAからデータをダウンロードします")
         response_data = ena_downloader.get_api_response(
             config.project_accession, session
         )
         sample_to_ftp_urls = ena_downloader.parse_response_data(response_data)
-        sample_to_fastqs = {}
-        # Download FASTQ files for each sample
-        for sample_acc, ftp_urls in sample_to_ftp_urls.items():
-            logger.info(f"Processing sample: {sample_acc}")
-            fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
-            if not fastq_files:
-                logger.warning(f"No FASTQ files downloaded for {sample_acc}")
-                continue
-            # Sort to ensure deterministic ordering; R1 then R2
-            fastq_files_sorted: List[Path] = sorted(
-                fastq_files,
-                key=lambda p: ("R2" in p.name, p.name),
-            )
-            sample_to_fastqs[sample_acc] = fastq_files_sorted
 
-    # Iterate over samples (either downloaded or local)
+        # ENAダウンロードしたFASTQを一時的に保存する辞書
+        downloaded_fastqs_root = config.results_dir / "ena_fastq"
+        downloaded_fastqs_root.mkdir(parents=True, exist_ok=True)
+
+        # ENAダウンロードしたFASTQファイル全てを一時保存
+        for sample_acc, ftp_urls in sample_to_ftp_urls.items():
+            logger.info(f"ENA sample {sample_acc} をダウンロード中...")
+            fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
+
+            if not fastq_files:
+                logger.warning(f"FASTQファイルがダウンロードできませんでした: {sample_acc}")
+                continue
+
+            # サンプル毎の保存ディレクトリ
+            sample_dir = downloaded_fastqs_root / sample_acc
+            sample_dir.mkdir(parents=True, exist_ok=True)
+
+            # ダウンロードしたFASTQをサンプルディレクトリへ移動
+            for f in fastq_files:
+                f.rename(sample_dir / f.name)
+
+        # 8. ダウンロード済みFASTQをまとめてパース
+        sample_to_reads = parse_fastq_general(downloaded_fastqs_root)
+        if not sample_to_reads:
+            logger.error("FASTQファイルが見つかりませんでした: %s", downloaded_fastqs_root)
+            sys.exit(1)            
+
+        # 9. レーンマージ
+        merged_dir = config.results_dir / "merged_fastq"
+        sample_to_fastqs = merge_lanes_by_cat(sample_to_reads, merged_dir, logger)
+        if not sample_to_fastqs:
+            logger.error("レーンマージに失敗しました: %s", merged_dir)
+            sys.exit(1)
+
+    # 10. 各サンプルの解析を実行
     for sample_acc, fastq_files in tqdm(
         sample_to_fastqs.items(), desc="progress", unit="sample"
     ):
-        logger.info(f"Running analysis for sample/lane: {sample_acc}")
-        # Step 2: BWA mapping (paired or single)
+        logger.info("サンプル/ラインの解析を実行します: %s", sample_acc)
+
+        # 11. BWAマッピングを実行
         bam_file = bwa_mapper.run_mapping_pipeline(sample_acc, fastq_files)
         if not bam_file:
-            logger.error(f"Mapping failed for {sample_acc}")
+            logger.error("マッピングに失敗しました: %s", sample_acc)
             continue
-        # Step 3: Soft clipping
+
+        # 12. Soft clippingを実行
         softclipped_bam = softclipper.run_softclipping(sample_acc, bam_file)
         if not softclipped_bam:
-            logger.error(f"Soft clipping failed for {sample_acc}")
+            logger.error("Soft clippingに失敗しました: %s", sample_acc)
             continue
-        _cleanup_intermediate_file(bam_file, logger)
-        # Step 4: BAM processing (sort, dedup, index)
+
+        cleanup_intermediate_file(bam_file, logger)
+
+        # 13. BAM processing (sort, dedup, index)
         dedup_bam = bam_processor.run_bam_processing(sample_acc, softclipped_bam)
         if not dedup_bam:
-            logger.error(f"BAM processing failed for {sample_acc}")
+            logger.error("BAM processingに失敗しました: %s", sample_acc)
             continue
-        # Step 5: mapDamage analysis
+
+        # 14. mapDamage analysisを実行
         mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, softclipped_bam)
         if not mapdamage_result:
-            logger.error(f"MapDamage analysis failed for {sample_acc}")
+            logger.error("MapDamage analysisに失敗しました: %s", sample_acc)
             continue
-        # Clean up BWA intermediate files created in bam_files/ directory
+
+        # 15. BWAの中間ファイルを削除
         bam_dir = dedup_bam.parent.parent / "bam_files"
         if bam_dir.exists():
             for pattern in ("*.bam", "*.bai", "*.truncated"):
                 for intermediate in bam_dir.glob(pattern):
-                    _cleanup_intermediate_file(intermediate, logger)
-        # Step 6: Qualimap analysis
+                    cleanup_intermediate_file(intermediate, logger)
+
+        # 16. Qualimap analysisを実行
         qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
         if not qualimap_result:
-            logger.error(f"Qualimap analysis failed for {sample_acc}")
+            logger.error("Qualimap analysisに失敗しました: %s", sample_acc)
             continue
-        # Step 7: HaplotypeCaller
+
+        # 17. HaplotypeCallerを実行
         vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
         if not vcf_file:
-            logger.error(f"HaplotypeCaller failed for {sample_acc}")
+            logger.error("HaplotypeCallerに失敗しました: %s", sample_acc)
             continue
-        # Cleanup deduplicated BAM and its index after analyses are complete
+
+        # 18. 重複除去済みBAMとそのインデックスを削除
         dedup_bam_index = Path(str(dedup_bam) + ".bai")
-        _cleanup_intermediate_file(dedup_bam_index, logger)
-        _cleanup_intermediate_file(dedup_bam, logger)
-        _cleanup_intermediate_file(softclipped_bam, logger)
-        logger.info(f"Completed processing for {sample_acc}")
-    logger.info("Pipeline completed successfully!")
+        cleanup_intermediate_file(dedup_bam_index, logger)
+        cleanup_intermediate_file(dedup_bam, logger)
+        cleanup_intermediate_file(softclipped_bam, logger)
+
+        logger.info("サンプル/ラインの解析を完了しました: %s", sample_acc)
+
+    logger.info("パイプラインを完了しました!")
 
 
 if __name__ == "__main__":
