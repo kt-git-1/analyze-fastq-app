@@ -156,7 +156,7 @@ def main() -> None:
 
         cleanup_intermediate_file(bam_file, logger)
 
-        # 13. BAM processing (sort, dedup, index)
+        # 13. BAM processing (dedup, index)
         dedup_bam = bam_processor.run_bam_processing(sample_acc, softclipped_bam)
         if not dedup_bam:
             logger.error("BAM processingに失敗しました: %s", sample_acc)
