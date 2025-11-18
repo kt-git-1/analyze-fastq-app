@@ -38,7 +38,7 @@ class BWAMapper:
                 return None
             # BWA MEM (ペアエンド)
             # ancient
-            if self.config.is_ancient:
+            if self.config.data_type == "ancient":
                 collapsed_file = temp_prefix.with_suffix(".collapsed.truncated")
                 R1_file = temp_prefix.with_suffix(".R1.truncated")
                 R2_file = temp_prefix.with_suffix(".R2.truncated")
