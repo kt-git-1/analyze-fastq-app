@@ -24,7 +24,7 @@ class SoftClipper:
         actual_length = len(read.query_sequence) if read.query_sequence else 0
         
         if actual_length != expected_length:
-            logger.warning(f"CIGAR mismatch for {read.query_name}")
+            logger.warning(f"{read.query_name}のCIGAR長が一致しません")
         
         new_cigar = []
         total_clip = self.clip_length
@@ -55,7 +55,7 @@ class SoftClipper:
             if read.query_qualities:
                 read.query_qualities = read.query_qualities[:final_expected_length]
         elif actual_length < final_expected_length:
-            logger.warning(f"Length mismatch after adjustment for {read.query_name}")
+            logger.warning(f"{read.query_name}のCIGAR長が一致しません")
             return None
         
         read.cigartuples = new_cigar + adjusted_cigar
@@ -65,7 +65,7 @@ class SoftClipper:
     
     def run_softclipping(self, sample_acc, bam_file):
         """Apply softclipping to BAM file"""
-        logger.info(f"Running softclipping for {sample_acc}")
+        logger.info(f"softclippingを実行します: {sample_acc}")
         
         input_bam = bam_file
         sample_dir = self.config.results_dir / sample_acc / "softclipped"
@@ -88,8 +88,8 @@ class SoftClipper:
                         for r in valid_reads:
                             out_bam.write(r)
             
-            logger.info(f"Softclipping completed for {sample_acc}")
+            logger.info(f"softclippingが完了しました: {sample_acc}")
             return output_bam
         except Exception as e:
-            logger.error(f"Softclipping failed for {sample_acc}: {e}")
+            logger.error(f"softclippingに失敗しました: {sample_acc}: {e}")
             return None 
