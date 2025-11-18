@@ -45,7 +45,16 @@ class PipelineConfig:
         # ローカルファイルを解析する場合、ENAからのダウンロードはスキップされ、代わりにこのディレクトリを探索してR1/R2ペアを検出します。
         self.fastq_dir: Optional[Path] = args.fastq_dir
 
-        # 6. 必要なディレクトリを自動生成
+        # 6. データがmodernかancientか指定
+        self.data_type: str = getattr(args, "data_type", "ancient")
+        @property
+        def is_ancient(self) -> bool:
+            return self.data_type == "ancient"
+        @property
+        def is_modern(self) -> bool:
+            return self.data_type == "modern"
+
+        # 7. 必要なディレクトリを自動生成
         # ローカルファイルを解析する場合、raw_data_dirは使用されないが、下流のモジュールとの互換性を維持するために保持されています。
         for dir_path in [
             self.raw_data_dir,
@@ -54,6 +63,7 @@ class PipelineConfig:
             self.temp_dir,
         ]:
             dir_path.mkdir(parents=True, exist_ok=True)
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,7 +133,16 @@ def parse_args() -> argparse.Namespace:
             "指定すると、パイプラインは ENA からのダウンロードをスキップし、 "
             "このディレクトリからペアエンドの FASTQ ファイルを直接読み込みます。"
         ),
+    ),
+    # 10. データがmodernかancientか指定
+    parser.add_argument(
+        "--data_type",
+        type=str,
+        default="ancient",
+        help="データがmodernかancientか指定",
+        choices=["modern", "ancient"],
     )
+
     return parser.parse_args()
 
 
