@@ -28,22 +28,15 @@ class BAMProcessor:
                     logger.error(f"Command output: {e.output}")
                 raise
 
-        # Step 1: Sort
-        sorted_bam = sample_bam_dir / f"{base_name}.sorted.bam"
-        run_cmd([
-            "samtools", "sort", "-@", str(self.config.args.threads), 
-            "-o", str(sorted_bam), str(softclipped_bam)
-        ], "samtools sort")
-
-        # Step 2: CleanSam
+        # Step 1: CleanSam
         clean_bam = sample_bam_dir / f"{base_name}.clean.bam"
         run_cmd([
             "java", "-Xmx" + self.config.args.java_mem, "-jar", "/usr/local/bin/picard.jar",
-            "CleanSam", "I=" + str(sorted_bam), "O=" + str(clean_bam),
+            "CleanSam", "I=" + str(softclipped_bam), "O=" + str(clean_bam),
             "VALIDATION_STRINGENCY=LENIENT"
         ], "Picard CleanSam")
 
-        # Step 3: AddOrReplaceReadGroups
+        # Step 2: AddOrReplaceReadGroups
         grouped_bam = sample_bam_dir / f"{base_name}.grouped.bam"
         run_cmd([
             "java", "-Xmx" + self.config.args.java_mem, "-jar", "/usr/local/bin/picard.jar",
@@ -53,7 +46,7 @@ class BAMProcessor:
             "VALIDATION_STRINGENCY=LENIENT"
         ], "Picard AddOrReplaceReadGroups")
 
-        # Step 4: MarkDuplicates (REMOVE_DUPLICATESでdedupも同時に)
+        # Step 3: MarkDuplicates (REMOVE_DUPLICATESでdedupも同時に)
         marked_bam = sample_bam_dir / f"{base_name}.marked.bam"
         metrics_file = sample_bam_dir / f"{base_name}.marked_dup_metrics.txt"
         run_cmd([
@@ -62,14 +55,14 @@ class BAMProcessor:
             "M=" + str(metrics_file), "REMOVE_DUPLICATES=true", "VALIDATION_STRINGENCY=LENIENT"
         ], "Picard MarkDuplicates")
 
-        # Step 5: Sort deduplicated BAM
+        # Step 4: Sort deduplicated BAM
         final_dedup_bam = sample_dedup_dir / f"{base_name}.marked.dedup.sorted.bam"
         run_cmd([
             "samtools", "sort", "-o", str(final_dedup_bam), str(marked_bam)
         ], "samtools sort (dedup)")
 
-        # Step 6: Index
+        # Step 5: Index
         run_cmd(["samtools", "index", str(final_dedup_bam)], "samtools index")
 
-        logger.info(f"BAM processing completed for {sample_acc}")
+        logger.info(f"BAM processingが完了しました: {sample_acc}")
         return final_dedup_bam
