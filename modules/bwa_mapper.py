@@ -156,13 +156,13 @@ class BWAMapper:
             "--threads", str(self.config.args.threads)
         ]
 
-        if self.config.is_ancient:
+        if self.config.data_type == "ancient":
             base_cmd.extend([
                 "--minquality", "20", 
                 "--minlength", "30",
                 "--collapse"
             ])
-        elif self.config.is_modern:
+        elif self.config.data_type == "modern":
             base_cmd.extend([
                 "--minquality", "25", 
                 "--minlength", "25"
@@ -181,12 +181,12 @@ class BWAMapper:
             "--threads", str(self.config.args.threads)
         ]
 
-        if self.config.is_ancient:
+        if self.config.data_type == "ancient":
             base_cmd.extend([
                 "--minquality", "20", 
                 "--minlength", "30",
             ])
-        elif self.config.is_modern:
+        elif self.config.data_type == "modern":
             base_cmd.extend([
                 "--minquality", "25", 
                 "--minlength", "25"
