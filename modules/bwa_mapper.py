@@ -277,7 +277,15 @@ class BWAMapper:
             logger.error("統合対象のBAMファイルがありません")
             return False
 
-        merge_cmd = ["samtools", "merge", "-o", str(merged_bam)] + bam_files
+        merge_cmd = [
+            "samtools", "merge",
+            # "-f",  # 既存の merged_bam を上書きしたい場合はこれを有効にする
+            str(merged_bam),
+            *bam_files,
+        ]
+
+        logger.info(f"samtools merge を実行します: {' '.join(merge_cmd)}")
+
         try:
             subprocess.run(merge_cmd, check=True)
             logger.info(f"統合BAMを作成しました: {merged_bam}")
