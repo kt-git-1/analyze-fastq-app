@@ -289,6 +289,12 @@ class BWAMapper:
         try:
             subprocess.run(merge_cmd, check=True)
             logger.info(f"統合BAMを作成しました: {merged_bam}")
+            
+            logger.info(f"統合BAMのインデックスを作成します: {merged_bam}")
+            index_cmd = ["samtools", "index", str(merged_bam)]
+            subprocess.run(index_cmd, check=True)
+            logger.info(f"統合BAMのインデックスを作成しました: {merged_bam}")
+            
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"samtools merge に失敗しました: {e}")
