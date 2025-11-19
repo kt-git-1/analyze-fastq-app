@@ -279,7 +279,7 @@ class BWAMapper:
 
         merge_cmd = [
             "samtools", "merge",
-            # "-f",  # 既存の merged_bam を上書きしたい場合はこれを有効にする
+            "-f",
             str(merged_bam),
             *bam_files,
         ]
