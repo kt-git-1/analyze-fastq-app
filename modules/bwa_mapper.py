@@ -81,8 +81,8 @@ class BWAMapper:
 
             # modern
             else:
-                temp_R1 = temp_prefix.with_suffix(".R1.truncated")
-                temp_R2 = temp_prefix.with_suffix(".R2.truncated")
+                temp_R1 = temp_prefix.with_suffix(".pair1.truncated")
+                temp_R2 = temp_prefix.with_suffix(".pair2.truncated")
                 if not (temp_R1.exists() and temp_R2.exists()):
                     logger.error(f"AdapterRemoval出力ファイルが見つかりませんでした: {sample_acc}")  
                     return None
