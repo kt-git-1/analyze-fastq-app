@@ -20,7 +20,7 @@ class ENADownloader:
             response.raise_for_status()
             return response.text
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching data for project {project_accession}: {e}")
+            logger.error(f"プロジェクト {project_accession} のデータ取得に失敗しました: {e}")
             sys.exit(1)
     
     def parse_response_data(self, response_data):
@@ -46,16 +46,16 @@ class ENADownloader:
             ftp_server = parse.netloc
             ftp_path = parse.path
             filename = os.path.basename(ftp_path)
-            logger.info(f"Downloading {filename} to {destination}")
+            logger.info(f"{filename} を {destination} にダウンロードします")
             with FTP(ftp_server) as ftp:
                 ftp.login()
                 ftp.cwd(os.path.dirname(ftp_path))
                 with open(destination, 'wb') as f:
                     ftp.retrbinary('RETR ' + filename, f.write)
-            logger.info(f"Downloaded {filename} to {destination}")
+            logger.info(f"{filename} を {destination} にダウンロードしました")
             return destination
         except Exception as e:
-            logger.error(f"Error downloading from {ftp_url}: {e}")
+            logger.error(f"{ftp_url} からダウンロードに失敗しました: {e}")
             raise
     
     def download_sample_data(self, sample_acc, ftp_urls):
@@ -80,6 +80,6 @@ class ENADownloader:
                     dest = future.result()
                     fastq_files.append(dest)
                 except Exception as e:
-                    logger.error(f"Failed download {url}: {e}")
+                    logger.error(f"{url} からダウンロードに失敗しました: {e}")
         
         return fastq_files 

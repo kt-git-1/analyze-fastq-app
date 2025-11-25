@@ -12,7 +12,7 @@ class MapDamageAnalyzer:
     
     def run_mapdamage(self, sample_acc, softclipped_bam):
         """Run mapDamage analysis"""
-        logger.info(f"Running mapDamage for {sample_acc}")
+        logger.info(f"mapDamageを実行します: {sample_acc}")
         
         sample_outdir = self.config.results_dir / sample_acc / "mapdamage"
         sample_outdir.mkdir(parents=True, exist_ok=True)
@@ -34,7 +34,7 @@ class MapDamageAnalyzer:
             # インデックス作成（BAI）
             subprocess.run(["samtools", "index", str(sorted_filtered_bam)], check=True)
         except subprocess.CalledProcessError as e:
-            logger.error(f"Filtering failed for {sample_acc}: {e}")
+            logger.error(f"フィルタリングに失敗しました: {sample_acc}: {e}")
             return None
         
         # Run mapDamage
@@ -46,10 +46,10 @@ class MapDamageAnalyzer:
         
         try:
             subprocess.run(mapdamage_cmd, check=True)
-            logger.info(f"mapDamage completed for {sample_acc}")
+            logger.info(f"mapDamageが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
-            logger.error(f"mapDamage failed for {sample_acc}: {e}")
+            logger.error(f"mapDamageに失敗しました: {sample_acc}: {e}")
             return None
 
 class QualimapAnalyzer:
@@ -65,15 +65,15 @@ class QualimapAnalyzer:
         - 成功時は出力ディレクトリの Path を、スキップまたは失敗時は None を返す
         """
 
-        logger.info(f"Running Qualimap for {sample_acc}")
+        logger.info(f"Qualimapを実行します: {sample_acc}")
         
         # 1. ファイル存在とサイズのチェック
         try:
             if dedup_bam is None or not dedup_bam.exists() or dedup_bam.stat().st_size == 0:
-                logger.warning(f"Skipping Qualimap for {sample_acc}: BAM file is missing or empty ({dedup_bam})")
+                logger.warning(f"Qualimapをスキップします: {sample_acc}: BAMファイルが見つかりませんまたは空です ({dedup_bam})")
                 return None
         except Exception as e:
-            logger.error(f"Failed to stat BAM file for {sample_acc}: {e}")
+            logger.error(f"BAMファイルのステータスを取得に失敗しました: {sample_acc}: {e}")
             return None
 
         # 2. マッピングされたリード数のチェック
@@ -86,13 +86,13 @@ class QualimapAnalyzer:
                 int(line.split()[2]) for line in idxstats.stdout.strip().split("\n") if line
             )
             if mapped_reads == 0:
-                logger.warning(f"Skipping Qualimap for {sample_acc}: no mapped reads in {dedup_bam}")
+                logger.warning(f"Qualimapをスキップします: {sample_acc}: {dedup_bam} にマッピングされたリードがありません")
                 return None
         except subprocess.CalledProcessError as e:
-            logger.error(f"samtools idxstats failed for {sample_acc}: {e}")
+            logger.error(f"samtools idxstatsに失敗しました: {sample_acc}: {e}")
             return None
         except FileNotFoundError:
-            logger.error("samtools not found. Please ensure samtools is installed and in PATH.")
+            logger.error("samtoolsが見つかりません。samtoolsがインストールされているか、PATHに追加されているか確認してください。")
             return None
 
         # 3. 出力ディレクトリを作成
@@ -114,10 +114,10 @@ class QualimapAnalyzer:
         env["JAVA_TOOL_OPTIONS"] = env.get("JAVA_TOOL_OPTIONS", "") + " -XX:+IgnoreUnrecognizedVMOptions"
         try:
             subprocess.run(qualimap_cmd, check=True, env=env)
-            logger.info(f"Qualimap completed for {sample_acc}")
+            logger.info(f"Qualimapが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
-            logger.error(f"Qualimap failed for {sample_acc}: {e}")
+            logger.error(f"Qualimapに失敗しました: {sample_acc}: {e}")
             return None
 
 class HaplotypeCaller:
@@ -126,7 +126,7 @@ class HaplotypeCaller:
     
     def run_haplotypecaller(self, sample_acc, dedup_bam):
         """Run GATK HaplotypeCaller"""
-        logger.info(f"Running HaplotypeCaller for {sample_acc}")
+        logger.info(f"HaplotypeCallerを実行します: {sample_acc}")
         
         vcf_dir = self.config.results_dir / sample_acc / "vcf_files"
         vcf_dir.mkdir(parents=True, exist_ok=True)
@@ -144,8 +144,8 @@ class HaplotypeCaller:
         
         try:
             subprocess.run(haplotypecaller_cmd, check=True)
-            logger.info(f"HaplotypeCaller completed for {sample_acc}")
+            logger.info(f"HaplotypeCallerが完了しました: {sample_acc}")
             return vcf_file
         except subprocess.CalledProcessError as e:
-            logger.error(f"HaplotypeCaller failed for {sample_acc}: {e}")
+            logger.error(f"HaplotypeCallerに失敗しました: {sample_acc}: {e}")
             return None
