@@ -43,7 +43,8 @@ class BWAMapper:
                 R1_file = temp_prefix.with_suffix(".pair1.truncated")
                 R2_file = temp_prefix.with_suffix(".pair2.truncated")
                 partial_bams = []
-                # collapsed
+                
+                # 1) collapsed は single-end でマッピング
                 if collapsed_file.exists():
                     collapsed_bam = bam_dir / f"{sample_acc}.collapsed.sorted.bam"
                     bam = self.run_bwa_single_end_and_sort(collapsed_file, collapsed_bam, sample_acc)
@@ -51,27 +52,24 @@ class BWAMapper:
                         partial_bams.append(bam)
                 else:
                     logger.warning(f"collapsedファイルが見つかりませんでした: {collapsed_file}")
-                # non-collapsed R1
-                if R1_file.exists():
-                    R1_bam = bam_dir / f"{sample_acc}.R1.sorted.bam"
-                    bam = self.run_bwa_single_end_and_sort(R1_file, R1_bam, sample_acc)
+
+                # 2) non-collapsed は R1/R2 を paired-end でマッピング
+                if R1_file.exists() and R2_file.exists():
+                    pe_bam = bam_dir / f"{sample_acc}.pe.sorted.bam"
+                    bam = self.run_bwa_paired_and_sort(R1_file, R2_file, pe_bam, sample_acc)
                     if bam is not None:
                         partial_bams.append(bam)
                 else:
-                    logger.warning(f"R1ファイルが見つかりませんでした: {R1_file}")
-                # non-collapsed R2
-                if R2_file.exists():
-                    R2_bam = bam_dir / f"{sample_acc}.R2.sorted.bam"
-                    bam = self.run_bwa_single_end_and_sort(R2_file, R2_bam, sample_acc)
-                    if bam is not None:
-                        partial_bams.append(bam)
-                else:
-                    logger.warning(f"R2ファイルが見つかりませんでした: {R2_file}")
+                    if not R1_file.exists():
+                        logger.warning(f"R1ファイルが見つかりませんでした: {R1_file}")
+                    if not R2_file.exists():
+                        logger.warning(f"R2ファイルが見つかりませんでした: {R2_file}")
 
                 if not partial_bams:
                     logger.error(f"BWAマッピングに失敗しました: {sample_acc}")
                     return None
 
+                # 3) 常に merged.sorted.bam を作る（入力が1本でも downstream を安定させる）
                 merged_bam = bam_dir / f"{sample_acc}.merged.sorted.bam"
                 if not self.merge_bams(partial_bams, merged_bam):
                     logger.error(f"BAMマージに失敗しました: {sample_acc}")
@@ -225,6 +223,14 @@ class BWAMapper:
             if sort_proc.returncode != 0:
                 raise subprocess.CalledProcessError(sort_proc.returncode, sort_cmd)
 
+            # upstream の終了コードも確認（空BAMなどの事故を防ぐ）
+            view_proc.wait()
+            if view_proc.returncode != 0:
+                raise subprocess.CalledProcessError(view_proc.returncode, view_cmd)
+            bwa_proc.wait()
+            if bwa_proc.returncode != 0:
+                raise subprocess.CalledProcessError(bwa_proc.returncode, bwa_cmd)
+
             logger.info(f"single-end BWAマッピングが完了しました: {fastq.name} → {bam_out.name}")
             return bam_out
         except subprocess.CalledProcessError as e:
@@ -261,6 +267,14 @@ class BWAMapper:
             sort_proc.wait()
             if sort_proc.returncode != 0:
                 raise subprocess.CalledProcessError(sort_proc.returncode, sort_cmd)
+
+            # upstream の終了コードも確認（空BAMなどの事故を防ぐ）
+            view_proc.wait()
+            if view_proc.returncode != 0:
+                raise subprocess.CalledProcessError(view_proc.returncode, view_cmd)
+            bwa_proc.wait()
+            if bwa_proc.returncode != 0:
+                raise subprocess.CalledProcessError(bwa_proc.returncode, bwa_cmd)
 
             logger.info(f"pair-end BWAマッピングが完了しました: {fastq1.name}, {fastq2.name} → {bam_out.name}")
             return bam_out
