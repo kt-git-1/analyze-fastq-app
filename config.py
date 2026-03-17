@@ -3,6 +3,7 @@ from pathlib import Path
 import logging
 import re
 import shlex
+import shutil
 import subprocess
 from typing import Dict, List, Optional, Union
 
@@ -13,57 +14,32 @@ class PipelineConfig:
     そこから導かれる設定値を一元管理するためのクラスです。
     """
 
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace) -> None:
         # 1. コマンドライン引数を取得
         self.args = args
         self.script_dir = Path(__file__).parent.resolve()
         self.base_dir: Path = args.base_dir
-
         # 2. fastq_dirが指定されている場合は project_accessionを上書き
         self.fastq_dir: Optional[Path] = args.fastq_dir
         if self.fastq_dir:
             self.project_accession = self.fastq_dir.name
         else:
-            self.project_accession: str = args.project_accession
-
+            self.project_accession = args.project_accession
         # 3. ディレクトリ構造をセットアップ
-        # ローカルファイルを解析する場合、raw_data_dirは使用されないが、下流のモジュールとの互換性を維持するために保持されています。
-        # 結果とログは、データソースに関係なく、base_dirに対して相対的に書き込まれます。
         self.raw_data_dir: Path = self.base_dir / "raw_data" / self.project_accession
         self.results_dir: Path = self.base_dir / "results" / self.project_accession
         self.logs_dir: Path = self.base_dir / "logs"
         self.temp_dir: Path = self.base_dir / "temp"
-
         # 4. リファレンスゲノムのパスを決定
-        # デフォルトでは `equCab3.nochrUn.fa` を設定
         self.reference_genome: Path = (
             args.reference_genome
             or (self.base_dir / "reference" / "equCab3.nochrUn.fa")
         )
-
-        # 5. ローカルの FASTQ ディレクトリ（任意）を保存
-        # ローカルファイルを解析する場合、ENAからのダウンロードはスキップされ、代わりにこのディレクトリを探索してR1/R2ペアを検出します。
-        self.fastq_dir: Optional[Path] = args.fastq_dir
-
-        # 6. データがmodernかancientか指定
+        # 5. データタイプの保持
         self.data_type: str = getattr(args, "data_type", "ancient")
-        @property
-        def is_ancient(self) -> bool:
-            return self.data_type == "ancient"
-        @property
-        def is_modern(self) -> bool:
-            return self.data_type == "modern"
-
         # 7. 必要なディレクトリを自動生成
-        # ローカルファイルを解析する場合、raw_data_dirは使用されないが、下流のモジュールとの互換性を維持するために保持されています。
-        for dir_path in [
-            self.raw_data_dir,
-            self.results_dir,
-            self.logs_dir,
-            self.temp_dir,
-        ]:
+        for dir_path in [self.raw_data_dir, self.results_dir, self.logs_dir, self.temp_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,53 +53,66 @@ def parse_args() -> argparse.Namespace:
     argparse.Namespace
         Parsed arguments namespace
     """
-    # 1. スクリプトのディレクトリを取得
     script_dir = Path(__file__).parent.resolve()
-    # 2. 引数パーサーを作成
     parser = argparse.ArgumentParser(
         description="NGSパイプラインの設定を管理するためのコマンドライン引数",
         fromfile_prefix_chars="@",
     )
-    # 3. プロジェクトアクセションを定義
+    # プロジェクトアクセッション
     parser.add_argument(
         "--project_accession",
         default="PRJEB19970",
-        help="ENAプロジェクトアクセション (ローカルファイルを解析する場合は無視されます)",
+        help="ENAプロジェクトアクセッション (ローカルファイルを解析する場合は無視されます)",
     )
-    # 4. ベースディレクトリを定義
+    # ベースディレクトリ
     parser.add_argument(
         "--base_dir",
         type=Path,
         default=script_dir / "data",
         help="データを保存するためのベースディレクトリ (raw, results, logs, temp)",
     )
-    # 5. リファレンスゲノムのパスを定義
+    # 参照ゲノム
     parser.add_argument(
         "--reference_genome",
         type=Path,
         help="参照ゲノム FASTA ファイル",
     )
-    # 6. ダウンロードの並列数を定義
+    # 並列ダウンロード数
     parser.add_argument(
         "--workers",
         type=int,
         default=4,
         help="並列ダウンロードのワーカー数（ローカル FASTQ モードの場合はほぼ使わない）",
     )
-    # 7. スレッド数を定義
+    # ダウンロードプロトコル
+    parser.add_argument(
+        "--download_protocol",
+        type=str,
+        choices=["ftp", "http"],
+        default="http",
+        help="FASTQ ファイルのダウンロードに使用するプロトコル。ftp または http を指定します (デフォルト: http)",
+    )
+    # ダウンロード失敗時の再試行回数
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=3,
+        help="ダウンロードが失敗した場合の最大再試行回数 (デフォルト: 3)",
+    )
+    # 分析に使用するスレッド数
     parser.add_argument(
         "--threads",
         type=int,
         default=20,
         help="分析に使用するスレッド数（マッピング、バリアントコーリングなど）",
     )
-    # 8. Javaメモリ設定を定義
+    # Javaメモリ設定
     parser.add_argument(
         "--java_mem",
         default="10g",
         help="GATKやその他のJavaツールに使用するJavaメモリ設定",
     )
-    # 9. ローカルの FASTQ ディレクトリを定義
+    # FASTQ ディレクトリ（ローカル）
     parser.add_argument(
         "--fastq_dir",
         type=Path,
@@ -133,8 +122,8 @@ def parse_args() -> argparse.Namespace:
             "指定すると、パイプラインは ENA からのダウンロードをスキップし、 "
             "このディレクトリからペアエンドの FASTQ ファイルを直接読み込みます。"
         ),
-    ),
-    # 10. データがmodernかancientか指定
+    )
+    # データ種別
     parser.add_argument(
         "--data_type",
         type=str,
@@ -142,203 +131,211 @@ def parse_args() -> argparse.Namespace:
         help="データがmodernかancientか指定",
         choices=["modern", "ancient"],
     )
-
+    # HTTPS ダウンロード
+    parser.add_argument(
+        "--download-via-https",
+        action="store_true",
+        help="ena_download_https でダウンロードしてから解析を実行（再開対応・HTTPS）",
+    )
     return parser.parse_args()
 
 
-def setup_logging(log_file: Optional[Path] = None) -> logging.Logger:
+def setup_logging(log_file: Path) -> logging.Logger:
     """
-    パイプラインのロギングを初期化するための関数。
-    ログは標準出力と、指定された場合はログファイルに書き込まれます。
-    ログファイルは、パイプラインの実行中に生成されます。
-
-    Parameters
-    ----------
-    log_file : Optional[Path], optional
-        ログファイルへのパス（指定されない場合は標準出力のみ）
-
-    Returns
-    -------
-    logging.Logger
-        設定されたLoggerインスタンス
+    パイプライン全体で使うロガーを初期化します。
     """
-    # 1. ハンドラーを初期化
-    handlers = []
-    # 2. コンソールハンドラーを追加
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    handlers.append(console_handler)
-    # 3. ログファイルハンドラーを追加（指定された場合）
-    if log_file:
-        file_handler = logging.FileHandler(str(log_file))
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        )
-        handlers.append(file_handler)
-    # 4. ロギングを初期化
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
-    # 5. Loggerインスタンスを取得
-    logger = logging.getLogger(__name__)
-    if log_file:
-        logger.info(f"ログをファイルに出力しています: {log_file}")
+
+    has_stream_handler = any(
+        isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        for handler in logger.handlers
+    )
+    if not has_stream_handler:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+    log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = any(
+        isinstance(handler, logging.FileHandler)
+        and Path(handler.baseFilename) == log_file
+        for handler in logger.handlers
+    )
+    if not file_exists:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
     return logger
 
 
-def cleanup_intermediate_file(path: Path, logger: logging.Logger) -> None:
+def cleanup_intermediate_file(file_path: Union[str, Path], logger: logging.Logger) -> None:
     """
-    中間ファイルを削除するための関数。
-    削除に失敗した場合は、パイプラインを中断せずに警告ログを出力します。
-
-    Parameters
-    ----------
-    path : Path
-        削除するファイルのパス
-    logger : logging.Logger
-        ステータスレポートのためのLogger
+    中間ファイルを削除します。存在しない場合は何もしません。
     """
-    # 1. ファイルが存在しない場合は何もしない
-    if not path:
+    path = Path(file_path)
+    if not path.exists():
         return
+
     try:
-        # 2. ファイルが存在する場合は削除
-        if path.exists():
-            path.unlink()
-            logger.info(f"中間ファイルを削除しました: {path}")
-    except Exception as exc:
-        logger.warning(f"中間ファイルを削除できませんでした: {path}: {exc}")
+        path.unlink()
+        logger.info("中間ファイルを削除しました: %s", path)
+    except OSError as exc:
+        logger.warning("中間ファイルを削除できませんでした: %s (%s)", path, exc)
 
 
-def parse_fastq_general(directory: Path) -> Dict[str, Dict[str, List[Path]]]:
+def _strip_fastq_suffix(filename: str) -> str:
+    for suffix in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+        if filename.endswith(suffix):
+            return filename[: -len(suffix)]
+    return filename
+
+
+def _classify_fastq_name(filename: str) -> tuple[Optional[str], str]:
     """
-    ZYJ2系, Filgen系, シングルトン系に対応して、
-    サンプルID × R1/R2 ごとに FASTQ/FQ をまとめる。
-
-    戻り値:
-      {
-        sample_id: {
-          "R1": [Path(...), ...],
-          "R2": [Path(...), ...],  # 無ければキー無し or 空リスト
-        },
-        ...
-      }
+    FASTQ ファイル名から sample 名のヒントと read 種別を推定します。
     """
+    stem = _strip_fastq_suffix(filename)
+    patterns = [
+        re.compile(r"^(?P<sample>.+?)_L\d{3}_R(?P<read>[12])(?:_\d+)?$"),
+        re.compile(r"^(?P<sample>.+?)_L\d+_(?P<read>[12])$"),
+        re.compile(r"^(?P<sample>.+?)[._-]R(?P<read>[12])(?:[._-]?\d+)?$", re.IGNORECASE),
+        re.compile(r"^(?P<sample>.+?)[._-](?P<read>[12])$"),
+    ]
 
-    # 例1: ZYJ2_S1_L005_R1_001.fastq.gz
-    illumina_pat = re.compile(
-        r"^(.+)_L\d{3}_R([12])_001\.fastq\.gz$"
-    )
+    for pattern in patterns:
+        match = pattern.match(stem)
+        if match:
+            return match.group("sample"), f"R{match.group('read')}"
 
-    # 例2: J01_001_NDSW42296_H7VHWDSXX_L1_1.fq.gz
-    filgen_pat = re.compile(
-        r"^(.+)_L\d+_([12])\.f(?:ast)?q\.gz$"
-    )
+    return None, "single"
 
-    # 例3: シングルトン（レーン情報やR1/R2がないもの）
-    # BER01_A__BER01_A_SCY2.2_user_TGACGT__... .fastq.gz など
-    singleton_pat = re.compile(
-        r"^(.+)\.f(?:ast)?q\.gz$"
-    )
 
+def parse_fastq_general(fastq_dir: Path) -> Dict[str, Dict[str, List[Path]]]:
+    """
+    FASTQ を再帰探索して sample ごとに R1/R2/single に分類します。
+    """
+    fastq_dir = Path(fastq_dir)
     sample_to_reads: Dict[str, Dict[str, List[Path]]] = {}
 
-    # サブディレクトリも含めて探索
-    for fastq in directory.rglob("*.f*q.gz"):
-        name = fastq.name
+    fastq_files = sorted(
+        [
+            *fastq_dir.rglob("*.fastq"),
+            *fastq_dir.rglob("*.fastq.gz"),
+            *fastq_dir.rglob("*.fq"),
+            *fastq_dir.rglob("*.fq.gz"),
+        ]
+    )
 
-        sample_id = None
-        read_num = None  # "1" / "2"
+    for fastq_file in fastq_files:
+        rel_parts = fastq_file.relative_to(fastq_dir).parts
+        sample_hint, read_key = _classify_fastq_name(fastq_file.name)
 
-        # 1. Illumina パターン
-        m = illumina_pat.match(name)
-        if m:
-            sample_id, read_num = m.group(1), m.group(2)
+        # sample ごとにサブディレクトリが切られている場合は最上位ディレクトリ名を優先。
+        if len(rel_parts) > 1:
+            sample_acc = rel_parts[0]
         else:
-            # 2. Filgen パターン
-            m = filgen_pat.match(name)
-            if m:
-                # sample_id をファイル名ベースにする場合
-                sample_id, read_num = m.group(1), m.group(2)
-                # フォルダ名をサンプルIDにしたいなら ↓ を使う
-                # sample_id = fastq.parent.name
-            else:
-                # 3. シングルトン → R1 とみなす
-                m = singleton_pat.match(name)
-                if m:
-                    sample_id = m.group(1)  # 拡張子を除いた全部をサンプルIDに
-                    read_num = "1"
-                else:
-                    # どのパターンにも合わなければスキップ
-                    continue
+            sample_acc = sample_hint or _strip_fastq_suffix(fastq_file.name)
 
-        reads = sample_to_reads.setdefault(sample_id, {})
-        key = f"R{read_num}"           # "R1" or "R2"
-        reads.setdefault(key, []).append(fastq)
+        read_bucket = sample_to_reads.setdefault(
+            sample_acc,
+            {"R1": [], "R2": [], "single": []},
+        )
+        read_bucket[read_key].append(fastq_file)
 
-    # 後段処理のため、ファイル名でソートしておく
-    for sample_id, reads in sample_to_reads.items():
-        for key in ("R1", "R2"):
-            if key in reads:
-                reads[key].sort(key=lambda p: p.name)
+    for read_bucket in sample_to_reads.values():
+        for key in ("R1", "R2", "single"):
+            read_bucket[key] = sorted(read_bucket[key])
 
     return sample_to_reads
 
 
+def _merge_or_passthrough(files: List[Path], destination: Path) -> Path:
+    """
+    1 ファイルならそのまま返し、複数なら gzip バイト列を順に連結します。
+    """
+    if len(files) == 1:
+        return files[0]
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as dst:
+        for src in files:
+            with src.open("rb") as fh:
+                shutil.copyfileobj(fh, dst)
+    return destination
+
 
 def merge_lanes_by_cat(
     sample_to_reads: Dict[str, Dict[str, List[Path]]],
-    out_dir: Path,
-    logger: Optional[object] = None,
+    merged_dir: Path,
+    logger: logging.Logger,
 ) -> Dict[str, List[Path]]:
     """
-    サンプル × R1/R2 ごとに複数レーンがあれば cat でマージする。
-    1ファイルしかない場合は元ファイルをそのまま返す（ファイル名に merged を付けない）。
-
-    Returns
-    -------
-    Dict[str, List[Path]]
-        {
-          sample_id: [R1_path, R2_path]  # R2 がなければ [R1_path]
-        }
+    サンプルごとのサブレーン FASTQ をまとめ、解析用の FASTQ 一覧を返します。
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    merged_dir = Path(merged_dir)
+    merged_dir.mkdir(parents=True, exist_ok=True)
 
-    merged: Dict[str, List[Path]] = {}
+    sample_to_fastqs: Dict[str, List[Path]] = {}
 
-    for sample_id, reads in sample_to_reads.items():
-        result_files: List[Path] = []
+    for sample_acc, read_bucket in sorted(sample_to_reads.items()):
+        r1_files = sorted(read_bucket.get("R1", []))
+        r2_files = sorted(read_bucket.get("R2", []))
+        single_files = sorted(read_bucket.get("single", []))
 
-        for read_key in ("R1", "R2"):
-            files = reads.get(read_key)
-            if not files:
+        if r1_files or r2_files:
+            if single_files:
+                logger.warning(
+                    "paired-end と single-end FASTQ が混在しているため single を無視します: %s",
+                    sample_acc,
+                )
+
+            if r1_files and r2_files:
+                if len(r1_files) != len(r2_files):
+                    logger.warning(
+                        "R1/R2 の本数が一致しませんが、そのままマージします: %s (R1=%d, R2=%d)",
+                        sample_acc,
+                        len(r1_files),
+                        len(r2_files),
+                    )
+
+                r1_merged = _merge_or_passthrough(
+                    r1_files,
+                    merged_dir / f"{sample_acc}.R1.fastq.gz",
+                )
+                r2_merged = _merge_or_passthrough(
+                    r2_files,
+                    merged_dir / f"{sample_acc}.R2.fastq.gz",
+                )
+                sample_to_fastqs[sample_acc] = [r1_merged, r2_merged]
                 continue
 
-            files = sorted(files, key=lambda p: p.name)
+            logger.warning(
+                "片側だけの paired-end FASTQ を single-end として扱います: %s",
+                sample_acc,
+            )
+            lone_reads = r1_files or r2_files
+            sample_to_fastqs[sample_acc] = [
+                _merge_or_passthrough(
+                    lone_reads,
+                    merged_dir / f"{sample_acc}.single.fastq.gz",
+                )
+            ]
+            continue
 
-            # ★ 1ファイル → cat しない・merged名にしない
-            if len(files) == 1:
-                if logger:
-                    logger.info(f"{sample_id} {read_key}: single FASTQ → no cat")
-                result_files.append(files[0])
-                continue
+        if single_files:
+            sample_to_fastqs[sample_acc] = [
+                _merge_or_passthrough(
+                    single_files,
+                    merged_dir / f"{sample_acc}.single.fastq.gz",
+                )
+            ]
 
-            # ★ 複数ファイル → cat する
-            suffix = "".join(files[0].suffixes)  # .fastq.gz / .fq.gz
-            merged_path = out_dir / f"{sample_id}_{read_key}_merged{suffix}"
-
-            file_list = " ".join(shlex.quote(str(p)) for p in files)
-            cmd = f"cat {file_list} > {shlex.quote(str(merged_path))}"
-
-            if logger:
-                logger.info(f"{sample_id} {read_key}: merging {len(files)} files → {merged_path}")
-                logger.info(f"Command: {cmd}")
-
-            subprocess.run(["bash", "-lc", cmd], check=True)
-
-            result_files.append(merged_path)
-
-        if result_files:
-            merged[sample_id] = result_files
-
-    return merged
+    return sample_to_fastqs

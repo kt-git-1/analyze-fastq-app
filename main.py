@@ -49,18 +49,40 @@ def main() -> None:
         config.project_accession,
     )
 
-    # 2. リファレンスゲノムの存在を確認
+    # 2. （オプション）HTTPS でダウンロードしてから解析
+    if getattr(args, "download_via_https", False):
+        logger.info("ena_download_https でダウンロードを実行します")
+        out_dir = config.raw_data_dir.parent  # base_dir/raw_data
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modules.ena_download_https",
+                "--project",
+                config.project_accession,
+                "--out",
+                str(out_dir),
+                "--workers",
+                str(config.args.workers),
+            ],
+            check=True,
+        )
+        # ダウンロード先を fastq_dir として使用（以降はローカル処理）
+        config.fastq_dir = config.raw_data_dir
+        logger.info("ダウンロード完了。解析を開始します")
+
+    # 3. リファレンスゲノムの存在を確認
     if not config.reference_genome.exists():
         logger.error("リファレンスゲノムが見つかりません: %s", config.reference_genome)
         sys.exit(1)
 
-    # 3. リファレンスゲノムのインデックスを作成
+    # 4. リファレンスゲノムのインデックスを作成
     fai = config.reference_genome.with_suffix(".fai")
     if not fai.exists():
         logger.info("リファレンスゲノムのインデックスを作成します")
         subprocess.run(["samtools", "faidx", str(config.reference_genome)], check=True)
 
-    # 4. モジュールをインスタンス化
+    # 5. モジュールをインスタンス化
     ena_downloader = ENADownloader(config)
     bwa_mapper = BWAMapper(config)
     softclipper = SoftClipper(config)
@@ -71,7 +93,7 @@ def main() -> None:
 
     session = requests.Session()
 
-    # 5. データソースを決定: ENAからのダウンロードか、ローカルのFASTQディレクトリ
+    # 6. データソースを決定: ENAからのダウンロードか、ローカルのFASTQディレクトリ
     if config.fastq_dir:
         # 6. ローカルのFASTQディレクトリを処理
         if not config.fastq_dir.exists() or not config.fastq_dir.is_dir():
