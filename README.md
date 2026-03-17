@@ -42,7 +42,7 @@
 
 ---
 
-## Quick Start
+## QuickStart
 
 ### ENA からダウンロードしてそのまま解析
 
