@@ -59,7 +59,6 @@ class SoftClipper:
             return None
         
         read.cigartuples = new_cigar + adjusted_cigar
-        read.is_paired = True
         
         return read
     

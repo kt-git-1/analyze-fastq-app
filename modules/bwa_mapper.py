@@ -128,19 +128,6 @@ class BWAMapper:
             logger.error(f"FASTQファイルが見つかりませんでした: {sample_acc}")
             return None
 
-    def validate_config(self):
-        """
-        設定の妥当性を検証
-        """
-        if not self.config.reference_genome.exists():
-            raise ValueError(f"Reference genomeが見つかりません: {self.config.reference_genome}")
-        
-        # 必要なツールの存在確認
-        required_tools = ['bwa', 'samtools', 'gatk', 'qualimap']
-        for tool in required_tools:
-            if not shutil.which(tool):
-                raise ValueError(f"必要なツールが見つかりません: {tool}") 
-
     def build_adapter_removal_cmd_paired(self, fastq1, fastq2, temp_prefix):
         """
         ancient/modernに応じてAdapterRemoval (ペアエンド)のコマンドを構築します。

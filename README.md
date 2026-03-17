@@ -269,6 +269,11 @@ my_fastqs/
 | `--fastq_dir` | 事前にダウンロードした FASTQ ディレクトリ | `None` |
 | `--download-via-https` | HTTPS ダウンロードしてから解析を実行 | `False` |
 | `--data_type` | `ancient` または `modern` | `ancient` |
+| `--force` | 完了済みサンプルのチェックポイントを無視して再実行 | `False` |
+| `--picard_jar` | Picard jar ファイルのパス | `/usr/local/bin/picard.jar` |
+| `--rg_library` | リードグループのライブラリ名 (RGLB) | `unknown` |
+| `--rg_center` | リードグループのシーケンシングセンター名 (RGCN) | `unknown` |
+| `--parallel_samples` | 同時に解析するサンプル数。合計スレッド数は `parallel_samples × threads` になる | `1` |
 
 ---
 
@@ -296,7 +301,7 @@ conda activate analyze-env
 
 `environment.yml` には Python 側依存が含まれます。外部ツールは各環境で別途インストールしてください。
 
-Picard は `modules/bam_processor.py` の実装上、`/usr/local/bin/picard.jar` を想定しています。別パスを使う場合はコード側の修正が必要です。
+Picard のデフォルトパスは `/usr/local/bin/picard.jar` です。別の場所にある場合は `--picard_jar` オプションで指定してください。
 
 ---
 
@@ -313,6 +318,7 @@ analyze-fastq-app/
 │   ├── bwa_mapper.py
 │   ├── ena_downloader.py
 │   ├── ena_download_https.py
+│   ├── fastq_parser.py
 │   ├── softclipper.py
 │   └── __init__.py
 ├── data/
@@ -329,7 +335,8 @@ analyze-fastq-app/
 ## 各モジュールの役割
 
 - `main.py`: パイプライン全体の制御
-- `config.py`: 引数解析、ログ設定、FASTQ 検出、レーン統合
+- `config.py`: 引数解析、ログ設定、環境検証
+- `modules/fastq_parser.py`: FASTQ 検出、サンプル分類、レーン統合
 - `modules/ena_downloader.py`: ENA API と通常ダウンロード
 - `modules/ena_download_https.py`: HTTPS ダウンロードと再開処理
 - `modules/bwa_mapper.py`: AdapterRemoval と BWA マッピング
