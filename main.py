@@ -15,7 +15,7 @@ from config import (
     cleanup_intermediate_file,
 )
 from modules.fastq_parser import parse_fastq_general, merge_lanes_by_cat
-from modules.ena_downloader import ENADownloader
+from modules.ena_downloader import ENADownloader, verify_file_md5
 from modules.bwa_mapper import BWAMapper
 from modules.softclipper import SoftClipper
 from modules.bam_processor import BAMProcessor
@@ -209,24 +209,37 @@ def main() -> None:
         response_data = ena_downloader.get_api_response(
             config.project_accession, session
         )
-        sample_to_ftp_urls = ena_downloader.parse_response_data(response_data)
+        sample_to_files = ena_downloader.parse_response_with_checksums(response_data)
 
         downloaded_fastqs_root = config.results_dir / "ena_fastq"
         downloaded_fastqs_root.mkdir(parents=True, exist_ok=True)
 
-        for sample_acc, ftp_urls in sample_to_ftp_urls.items():
+        for sample_acc, url_md5_pairs in sample_to_files.items():
             logger.info(f"ENA sample {sample_acc} をダウンロード中...")
+
+            sample_dir = downloaded_fastqs_root / sample_acc
+            sample_dir.mkdir(parents=True, exist_ok=True)
+
+            ftp_urls = [u for u, _ in url_md5_pairs]
             fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
 
             if not fastq_files:
                 logger.warning(f"FASTQファイルがダウンロードできませんでした: {sample_acc}")
                 continue
 
-            sample_dir = downloaded_fastqs_root / sample_acc
-            sample_dir.mkdir(parents=True, exist_ok=True)
+            url_to_md5 = {
+                Path(u.rstrip("/").split("/")[-1]): md5
+                for u, md5 in url_md5_pairs
+                if md5
+            }
 
             for f in fastq_files:
-                f.rename(sample_dir / f.name)
+                dest = sample_dir / f.name
+                f.rename(dest)
+                expected_md5 = url_to_md5.get(Path(f.name))
+                if expected_md5 and not verify_file_md5(dest, expected_md5):
+                    logger.warning("MD5不一致のため削除します: %s", dest)
+                    dest.unlink(missing_ok=True)
 
         sample_to_reads = parse_fastq_general(downloaded_fastqs_root)
         if not sample_to_reads:

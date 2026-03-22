@@ -9,8 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 本体は変更しない（友人コード）
-from modules.ena_downloader import ENADownloader
+from modules.ena_downloader import ENADownloader, verify_file_md5
 
 
 def build_https_session() -> requests.Session:
@@ -53,19 +52,28 @@ def download_via_https(
     url: str,
     destination: Path,
     chunk_size: int = 1024 * 1024,
+    expected_md5: str | None = None,
 ) -> Path:
-    """HTTPS ダウンロード（再開対応）"""
+    """HTTPS ダウンロード（再開対応・MD5 検証付き）"""
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     headers = {}
     mode = "wb"
 
-    if destination.exists():
+    resume = False
+    if destination.exists() and expected_md5 is None:
         size = destination.stat().st_size
         if size > 0:
             headers["Range"] = f"bytes={size}-"
             mode = "ab"
+            resume = True
             logging.info(f"再開DL: {destination.name} ({size} bytes)")
+    elif destination.exists() and expected_md5 is not None:
+        if verify_file_md5(destination, expected_md5):
+            logging.info(f"MD5一致 (スキップ): {destination.name}")
+            return destination
+        logging.warning(f"MD5不一致 → 最初から再DL: {destination.name}")
+        destination.unlink(missing_ok=True)
 
     last_err = None
     for attempt in range(1, 6):
@@ -76,7 +84,6 @@ def download_via_https(
                 headers=headers,
                 timeout=(10, 300),
             ) as r:
-                # Range を無視されたら最初から
                 if "Range" in headers and r.status_code == 200:
                     logging.warning(f"Range無視 → 最初から再DL: {destination.name}")
                     destination.unlink(missing_ok=True)
@@ -90,6 +97,16 @@ def download_via_https(
                         if chunk:
                             f.write(chunk)
 
+            if expected_md5 and not verify_file_md5(destination, expected_md5):
+                logging.warning(
+                    f"DL後 MD5不一致 ({attempt}/5): {destination.name} → 再ダウンロード"
+                )
+                destination.unlink(missing_ok=True)
+                headers.pop("Range", None)
+                mode = "wb"
+                resume = False
+                continue
+
             logging.info(f"DL完了: {destination.name}")
             return destination
 
@@ -101,7 +118,6 @@ def download_via_https(
             )
             time.sleep(wait)
 
-    # last_err が None の可能性もあるので安全に例外化
     raise RuntimeError(f"download failed: {url}") from last_err
 
 
@@ -130,16 +146,16 @@ def main():
     downloader = ENADownloader(config)
     session_api = build_https_session()
 
-    # ENA APIは本体を利用（返り値は {sample_acc: [url, ...]}）
+    # ENA APIは本体を利用（返り値は {sample_acc: [(url, md5), ...]}）
     tsv = downloader.get_api_response(args.project, session_api)
-    sample_to_urls = downloader.parse_response_data(tsv)
+    sample_to_urls = downloader.parse_response_with_checksums(tsv)
 
     logging.info(f"検出されたサンプル数: {len(sample_to_urls)}")
 
     session_dl = build_https_session()
 
     # サンプル単位で保存: out/PROJECT/SAMPLE/ （main.py の --fastq_dir と互換）
-    for sample_acc, urls in sample_to_urls.items():
+    for sample_acc, url_md5_pairs in sample_to_urls.items():
         sample_dir = project_dir / sample_acc
         sample_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,7 +164,7 @@ def main():
             logging.info(f"SKIP (done): {sample_acc}")
             continue
 
-        for u in urls:
+        for u, md5 in url_md5_pairs:
             if not u.endswith(".gz"):
                 continue
 
@@ -156,7 +172,7 @@ def main():
             filename = Path(urlparse(https_url).path).name
             dest = sample_dir / filename
 
-            download_via_https(session_dl, https_url, dest)
+            download_via_https(session_dl, https_url, dest, expected_md5=md5)
 
         done_flag.touch()
         logging.info(f"MARK DONE: {sample_acc}")

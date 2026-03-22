@@ -1,3 +1,4 @@
+import hashlib
 import requests
 import logging
 import os
@@ -10,6 +11,21 @@ from pathlib import Path
 
 # Set up a module-level logger. 既存のロガーを使う場合は上書きされないようにします。
 logger = logging.getLogger(__name__)
+
+
+def verify_file_md5(path: Path, expected: str) -> bool:
+    """ファイルの MD5 ハッシュを計算し、期待値と比較する。"""
+    md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            md5.update(chunk)
+    actual = md5.hexdigest()
+    if actual != expected:
+        logger.warning(
+            "MD5 mismatch: %s (expected=%s, actual=%s)", path.name, expected, actual
+        )
+        return False
+    return True
 
 
 class ENADownloader:
@@ -54,7 +70,7 @@ class ENADownloader:
             "https://www.ebi.ac.uk/ena/portal/api/filereport"
             f"?accession={project_accession}"
             "&result=read_run"
-            "&fields=sample_accession,submitted_ftp"
+            "&fields=sample_accession,submitted_ftp,fastq_md5"
             "&format=tsv"
         )
         try:
@@ -94,6 +110,52 @@ class ENADownloader:
                     continue
                 sample_to_ftp_urls.setdefault(sample_acc, []).append(ftp_url)
         return sample_to_ftp_urls
+
+    def parse_response_with_checksums(self, response_data: str) -> dict:
+        """
+        API レスポンスを解析してサンプルごとの (URL, MD5) タプルのリストを作成します。
+
+        Returns
+        -------
+        dict
+            {sample_accession: [(ftp_url, md5_or_None), ...], ...}
+        """
+        sample_to_files: dict = {}
+        lines = response_data.strip().split("\n")
+        if len(lines) < 2:
+            return sample_to_files
+
+        header = lines[0].split("\t")
+        try:
+            sample_idx = header.index("sample_accession")
+            url_idx = header.index("submitted_ftp")
+        except ValueError:
+            logger.error("API レスポンスのヘッダーが不正です: %s", header)
+            return sample_to_files
+
+        md5_idx = header.index("fastq_md5") if "fastq_md5" in header else None
+
+        for line in lines[1:]:
+            parts = line.split("\t")
+            if len(parts) <= max(sample_idx, url_idx):
+                continue
+
+            sample_acc = parts[sample_idx]
+            ftp_urls = parts[url_idx].split(";")
+            md5s = (
+                parts[md5_idx].split(";")
+                if md5_idx is not None and len(parts) > md5_idx
+                else []
+            )
+
+            for i, ftp_url in enumerate(ftp_urls):
+                ftp_url = ftp_url.strip()
+                if not ftp_url:
+                    continue
+                md5 = md5s[i].strip() if i < len(md5s) and md5s[i].strip() else None
+                sample_to_files.setdefault(sample_acc, []).append((ftp_url, md5))
+
+        return sample_to_files
 
     # === Download helpers ===
     def download_from_ftp(self, ftp_url: str, destination: Path) -> Path:
