@@ -14,7 +14,7 @@ from config import (
     setup_logging,
     cleanup_intermediate_file,
 )
-from modules.fastq_parser import parse_fastq_general, merge_lanes_by_cat
+from modules.fastq_parser import group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
 from modules.ena_downloader import ENADownloader, verify_file_md5
 from modules.bwa_mapper import BWAMapper
 from modules.softclipper import SoftClipper
@@ -34,17 +34,14 @@ logger = logging.getLogger(__name__)
 
 def process_sample(
     sample_acc: str,
-    fastq_files: List[Path],
+    runs: List[Tuple[str, List[Path]]],
     config: PipelineConfig,
 ) -> Tuple[str, bool, str]:
     """
-    1 サンプル分の解析パイプライン（マッピング → QC → VCF）を実行する。
+    1 サンプル分の解析パイプラインを実行する。
 
-    各ワーカーでモジュールを独立にインスタンス化するため、
-    スレッド間で状態を共有しない。
-
-    完了したサンプルは <results_dir>/<sample_acc>/.done にフラグを残し、
-    再実行時にスキップされる。--force で上書き可能。
+    各ランを独立にマッピング → ソフトクリップ → CleanSam し、
+    その後サンプル単位でマージ → 重複除去 → QC → VCF を行う。
 
     Returns
     -------
@@ -65,58 +62,98 @@ def process_sample(
     qualimap_analyzer = QualimapAnalyzer(config)
     haplotypecaller = HaplotypeCaller(config)
 
-    logger.info("サンプルの解析を開始します: %s", sample_acc)
+    logger.info("サンプルの解析を開始します: %s (%d ラン)", sample_acc, len(runs))
 
-    # 1. BWA マッピング
-    bam_file = bwa_mapper.run_mapping_pipeline(sample_acc, fastq_files)
-    if not bam_file:
-        logger.error("マッピングに失敗しました: %s", sample_acc)
-        return sample_acc, False, "BWA mapping"
+    # ------------------------------------------------------------------
+    # Phase 1: ラン単位の処理
+    # ------------------------------------------------------------------
+    run_clean_bams: List[Path] = []
+    failed_runs: List[str] = []
 
-    # 2. Soft clipping
-    softclipped_bam = softclipper.run_softclipping(sample_acc, bam_file)
-    if not softclipped_bam:
-        logger.error("Soft clippingに失敗しました: %s", sample_acc)
-        return sample_acc, False, "Soft clipping"
+    for run_id, fastq_files in runs:
+        # 1. BWA マッピング
+        bam_file = bwa_mapper.run_mapping_pipeline(sample_acc, run_id, fastq_files)
+        if not bam_file:
+            logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
+            failed_runs.append(run_id)
+            continue
 
-    cleanup_intermediate_file(bam_file, logger)
+        # 2. Soft clipping
+        softclipped_bam = softclipper.run_softclipping(sample_acc, run_id, bam_file)
+        if not softclipped_bam:
+            logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
+            failed_runs.append(run_id)
+            continue
 
-    # 3. BAM processing (dedup, index)
-    dedup_bam = bam_processor.run_bam_processing(sample_acc, softclipped_bam)
+        cleanup_intermediate_file(bam_file, logger)
+
+        # 3. CleanSam (ラン単位)
+        try:
+            clean_bam = bam_processor.process_run_bam(sample_acc, run_id, softclipped_bam)
+        except Exception:
+            logger.exception("CleanSam 失敗 → ラン %s をスキップ", run_id)
+            failed_runs.append(run_id)
+            continue
+
+        cleanup_intermediate_file(softclipped_bam, logger)
+
+        if clean_bam:
+            run_clean_bams.append(clean_bam)
+        else:
+            failed_runs.append(run_id)
+
+    if failed_runs:
+        logger.warning(
+            "失敗したラン: %s (%d/%d)",
+            ", ".join(failed_runs),
+            len(failed_runs),
+            len(runs),
+        )
+
+    if not run_clean_bams:
+        logger.error("有効なランがありません: %s", sample_acc)
+        return sample_acc, False, "all runs failed"
+
+    # ------------------------------------------------------------------
+    # Phase 2: サンプル単位の処理
+    # ------------------------------------------------------------------
+
+    # 4. マージ + 重複除去
+    try:
+        dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
+    except Exception:
+        logger.exception("merge/dedup に失敗しました: %s", sample_acc)
+        return sample_acc, False, "merge/dedup"
+
     if not dedup_bam:
-        logger.error("BAM processingに失敗しました: %s", sample_acc)
-        return sample_acc, False, "BAM processing"
+        return sample_acc, False, "merge/dedup"
 
-    # 4. mapDamage analysis (dedup 済み BAM を使用)
+    # ラン単位の中間ファイルを削除
+    for bam in run_clean_bams:
+        cleanup_intermediate_file(bam, logger)
+
+    # 5. mapDamage (重複除去済み BAM を使用)
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
-        logger.error("MapDamage analysisに失敗しました: %s", sample_acc)
+        logger.error("mapDamage に失敗しました: %s", sample_acc)
         return sample_acc, False, "mapDamage"
 
-    # 5. BWA の中間ファイルを削除
-    bam_dir = dedup_bam.parent.parent / "bam_files"
-    if bam_dir.exists():
-        for pattern in ("*.bam", "*.bai", "*.truncated"):
-            for intermediate in bam_dir.glob(pattern):
-                cleanup_intermediate_file(intermediate, logger)
-
-    # 6. Qualimap analysis
+    # 6. Qualimap
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
-        logger.error("Qualimap analysisに失敗しました: %s", sample_acc)
+        logger.error("Qualimap に失敗しました: %s", sample_acc)
         return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
-        logger.error("HaplotypeCallerに失敗しました: %s", sample_acc)
+        logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
         return sample_acc, False, "HaplotypeCaller"
 
-    # 8. 中間ファイルを削除
+    # 8. 最終クリーンアップ
     dedup_bam_index = Path(str(dedup_bam) + ".bai")
     cleanup_intermediate_file(dedup_bam_index, logger)
     cleanup_intermediate_file(dedup_bam, logger)
-    cleanup_intermediate_file(softclipped_bam, logger)
 
     # 9. チェックポイント (.done) を記録
     done_flag.parent.mkdir(parents=True, exist_ok=True)
@@ -131,11 +168,8 @@ def process_sample(
 # ============================================================
 
 def main() -> None:
-    """
-    NGS解析パイプライン全体のエントリポイント。
-    ユーザーの入力に応じて、この関数はENAからリードデータをダウンロードするか、
-    またはローカルディレクトリ内の事前ダウンロード済みFASTQファイルを処理します。
-    """
+    """NGS 解析パイプライン全体のエントリポイント。"""
+
     # 1. 設定とロギングを初期化
     args = parse_args()
     config = PipelineConfig(args)
@@ -150,7 +184,7 @@ def main() -> None:
     # 2. （オプション）HTTPS でダウンロードしてから解析
     if getattr(args, "download_via_https", False):
         logger.info("ena_download_https でダウンロードを実行します")
-        out_dir = config.raw_data_dir.parent  # base_dir/raw_data
+        out_dir = config.raw_data_dir.parent
         subprocess.run(
             [
                 sys.executable,
@@ -184,27 +218,27 @@ def main() -> None:
 
     session = requests.Session()
 
-    # 6. データソースを決定: ENAからのダウンロードか、ローカルのFASTQディレクトリ
+    # 6. データソースを決定
     if config.fastq_dir:
         if not config.fastq_dir.exists() or not config.fastq_dir.is_dir():
             logger.error(
-                "指定されたFASTQディレクトリが存在しないか、ディレクトリではありません: %s",
+                "指定された FASTQ ディレクトリが存在しないか、ディレクトリではありません: %s",
                 config.fastq_dir,
             )
             sys.exit(1)
 
-        logger.info("ローカルのFASTQファイルを使用します: %s", config.fastq_dir)
+        logger.info("ローカルの FASTQ ファイルを使用します: %s", config.fastq_dir)
+        sample_to_runs = group_fastqs_by_run(config.fastq_dir)
 
-        sample_to_reads = parse_fastq_general(config.fastq_dir)
-        if not sample_to_reads:
-            logger.error("FASTQファイルが見つかりませんでした: %s", config.fastq_dir)
+        if not sample_to_runs:
+            logger.error("FASTQ ファイルが見つかりませんでした: %s", config.fastq_dir)
             sys.exit(1)
 
-        merged_dir = config.results_dir / "merged_fastq"
-        sample_to_fastqs = merge_lanes_by_cat(sample_to_reads, merged_dir, logger)
+        for sa, runs in sample_to_runs.items():
+            logger.info("  %s: %d ラン検出", sa, len(runs))
 
     else:
-        logger.info("ENAからデータをダウンロードします")
+        logger.info("ENA からデータをダウンロードします")
         ena_downloader = ENADownloader(config)
         response_data = ena_downloader.get_api_response(
             config.project_accession, session
@@ -215,7 +249,7 @@ def main() -> None:
         downloaded_fastqs_root.mkdir(parents=True, exist_ok=True)
 
         for sample_acc, url_md5_pairs in sample_to_files.items():
-            logger.info(f"ENA sample {sample_acc} をダウンロード中...")
+            logger.info("ENA sample %s をダウンロード中...", sample_acc)
 
             sample_dir = downloaded_fastqs_root / sample_acc
             sample_dir.mkdir(parents=True, exist_ok=True)
@@ -224,7 +258,7 @@ def main() -> None:
             fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
 
             if not fastq_files:
-                logger.warning(f"FASTQファイルがダウンロードできませんでした: {sample_acc}")
+                logger.warning("FASTQ がダウンロードできませんでした: %s", sample_acc)
                 continue
 
             url_to_md5 = {
@@ -232,29 +266,22 @@ def main() -> None:
                 for u, md5 in url_md5_pairs
                 if md5
             }
-
             for f in fastq_files:
                 dest = sample_dir / f.name
                 f.rename(dest)
                 expected_md5 = url_to_md5.get(Path(f.name))
                 if expected_md5 and not verify_file_md5(dest, expected_md5):
-                    logger.warning("MD5不一致のため削除します: %s", dest)
+                    logger.warning("MD5 不一致のため削除します: %s", dest)
                     dest.unlink(missing_ok=True)
 
-        sample_to_reads = parse_fastq_general(downloaded_fastqs_root)
-        if not sample_to_reads:
-            logger.error("FASTQファイルが見つかりませんでした: %s", downloaded_fastqs_root)
-            sys.exit(1)
-
-        merged_dir = config.results_dir / "merged_fastq"
-        sample_to_fastqs = merge_lanes_by_cat(sample_to_reads, merged_dir, logger)
-        if not sample_to_fastqs:
-            logger.error("レーンマージに失敗しました: %s", merged_dir)
+        sample_to_runs = group_fastqs_by_run(downloaded_fastqs_root)
+        if not sample_to_runs:
+            logger.error("FASTQ ファイルが見つかりませんでした: %s", downloaded_fastqs_root)
             sys.exit(1)
 
     # 7. 各サンプルの解析を実行
     parallel_samples: int = getattr(args, "parallel_samples", 1)
-    total_samples = len(sample_to_fastqs)
+    total_samples = len(sample_to_runs)
 
     logger.info(
         "解析対象: %d サンプル (並列数: %d)",
@@ -266,21 +293,19 @@ def main() -> None:
     failed: List[Tuple[str, str]] = []
 
     if parallel_samples <= 1:
-        # --- 逐次実行 ---
-        for sample_acc, fastq_files in tqdm(
-            sample_to_fastqs.items(), desc="progress", unit="sample"
+        for sample_acc, runs in tqdm(
+            sample_to_runs.items(), desc="progress", unit="sample"
         ):
-            acc, ok, step = process_sample(sample_acc, fastq_files, config)
+            acc, ok, step = process_sample(sample_acc, runs, config)
             if ok:
                 succeeded.append(acc)
             else:
                 failed.append((acc, step))
     else:
-        # --- 並列実行 ---
         with ThreadPoolExecutor(max_workers=parallel_samples) as executor:
             future_to_acc = {
-                executor.submit(process_sample, acc, fqs, config): acc
-                for acc, fqs in sample_to_fastqs.items()
+                executor.submit(process_sample, acc, runs, config): acc
+                for acc, runs in sample_to_runs.items()
             }
             with tqdm(total=total_samples, desc="progress", unit="sample") as pbar:
                 for future in as_completed(future_to_acc):

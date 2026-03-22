@@ -62,14 +62,14 @@ class SoftClipper:
         
         return read
     
-    def run_softclipping(self, sample_acc, bam_file):
+    def run_softclipping(self, sample_acc, run_id, bam_file):
         """Apply softclipping to BAM file"""
-        logger.info(f"softclippingを実行します: {sample_acc}")
+        logger.info("softclipping を実行します: %s / %s", sample_acc, run_id)
         
         input_bam = bam_file
-        sample_dir = self.config.results_dir / sample_acc / "softclipped"
+        sample_dir = self.config.results_dir / sample_acc / "runs" / run_id / "softclipped"
         sample_dir.mkdir(parents=True, exist_ok=True)
-        output_bam = sample_dir / f"{sample_acc}_softclipped.bam"
+        output_bam = sample_dir / f"{run_id}_softclipped.bam"
         
         try:
             with pysam.AlignmentFile(input_bam, "rb") as in_bam, \
@@ -87,8 +87,8 @@ class SoftClipper:
                         for r in valid_reads:
                             out_bam.write(r)
             
-            logger.info(f"softclippingが完了しました: {sample_acc}")
+            logger.info("softclipping が完了しました: %s / %s", sample_acc, run_id)
             return output_bam
         except Exception as e:
-            logger.error(f"softclippingに失敗しました: {sample_acc}: {e}")
+            logger.error("softclipping に失敗しました: %s / %s: %s", sample_acc, run_id, e)
             return None 
