@@ -98,14 +98,21 @@ def download_via_https(
                             f.write(chunk)
 
             if expected_md5 and not verify_file_md5(destination, expected_md5):
-                logging.warning(
-                    f"DL後 MD5不一致 ({attempt}/5): {destination.name} → 再ダウンロード"
-                )
-                destination.unlink(missing_ok=True)
-                headers.pop("Range", None)
-                mode = "wb"
-                resume = False
-                continue
+                if attempt < 5:
+                    logging.warning(
+                        f"DL後 MD5不一致 ({attempt}/5): {destination.name} → 再ダウンロード"
+                    )
+                    destination.unlink(missing_ok=True)
+                    headers.pop("Range", None)
+                    mode = "wb"
+                    resume = False
+                    continue
+                else:
+                    logging.warning(
+                        "MD5不一致が解消しません: %s "
+                        "(ENA メタデータと実ファイルの不整合の可能性あり → ファイルを保持して続行)",
+                        destination.name,
+                    )
 
             logging.info(f"DL完了: {destination.name}")
             return destination

@@ -70,7 +70,7 @@ class ENADownloader:
             "https://www.ebi.ac.uk/ena/portal/api/filereport"
             f"?accession={project_accession}"
             "&result=read_run"
-            "&fields=sample_accession,submitted_ftp,fastq_md5"
+            "&fields=sample_accession,submitted_ftp,submitted_md5"
             "&format=tsv"
         )
         try:
@@ -133,7 +133,7 @@ class ENADownloader:
             logger.error("API レスポンスのヘッダーが不正です: %s", header)
             return sample_to_files
 
-        md5_idx = header.index("fastq_md5") if "fastq_md5" in header else None
+        md5_idx = header.index("submitted_md5") if "submitted_md5" in header else None
 
         for line in lines[1:]:
             parts = line.split("\t")
