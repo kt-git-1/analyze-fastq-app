@@ -62,7 +62,20 @@ def process_sample(
     qualimap_analyzer = QualimapAnalyzer(config)
     haplotypecaller = HaplotypeCaller(config)
 
-    logger.info("サンプルの解析を開始します: %s (%d ラン)", sample_acc, len(runs))
+    # ステップ数: ラン単位 3 ステップ × N ラン + サンプル単位 4 ステップ
+    total_steps = 3 * len(runs) + 4
+    current_step = 0
+
+    def _log_progress(step_name: str) -> None:
+        nonlocal current_step
+        current_step += 1
+        pct = int(current_step / total_steps * 100)
+        logger.info(
+            "[%s] %d%% (%d/%d) %s",
+            sample_acc, pct, current_step, total_steps, step_name,
+        )
+
+    logger.info("サンプルの解析を開始します: %s (%d ラン, %d ステップ)", sample_acc, len(runs), total_steps)
 
     # ------------------------------------------------------------------
     # Phase 1: ラン単位の処理
@@ -70,24 +83,29 @@ def process_sample(
     run_clean_bams: List[Path] = []
     failed_runs: List[str] = []
 
-    for run_id, fastq_files in runs:
+    for run_idx, (run_id, fastq_files) in enumerate(runs, 1):
         # 1. BWA マッピング
+        _log_progress(f"BWA mapping ({run_id}) [{run_idx}/{len(runs)}]")
         bam_file = bwa_mapper.run_mapping_pipeline(sample_acc, run_id, fastq_files)
         if not bam_file:
             logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
             failed_runs.append(run_id)
+            current_step += 2
             continue
 
         # 2. Soft clipping
+        _log_progress(f"Soft clipping ({run_id})")
         softclipped_bam = softclipper.run_softclipping(sample_acc, run_id, bam_file)
         if not softclipped_bam:
             logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
             failed_runs.append(run_id)
+            current_step += 1
             continue
 
         cleanup_intermediate_file(bam_file, logger)
 
         # 3. CleanSam (ラン単位)
+        _log_progress(f"CleanSam ({run_id})")
         try:
             clean_bam = bam_processor.process_run_bam(sample_acc, run_id, softclipped_bam)
         except Exception:
@@ -119,6 +137,7 @@ def process_sample(
     # ------------------------------------------------------------------
 
     # 4. マージ + 重複除去
+    _log_progress("Merge + MarkDuplicates")
     try:
         dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
     except Exception:
@@ -128,23 +147,25 @@ def process_sample(
     if not dedup_bam:
         return sample_acc, False, "merge/dedup"
 
-    # ラン単位の中間ファイルを削除
     for bam in run_clean_bams:
         cleanup_intermediate_file(bam, logger)
 
-    # 5. mapDamage (重複除去済み BAM を使用)
+    # 5. mapDamage
+    _log_progress("mapDamage")
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
         return sample_acc, False, "mapDamage"
 
     # 6. Qualimap
+    _log_progress("Qualimap")
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
         return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
+    _log_progress("HaplotypeCaller")
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)

@@ -134,11 +134,16 @@ class BAMProcessor:
     # ------------------------------------------------------------------
 
     def _run_cmd(self, cmd: list, step_name: str) -> None:
-        try:
-            logger.info("Running: %s", " ".join(str(c) for c in cmd))
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            logger.error("Error in %s: %s", step_name, e)
-            if e.stderr:
-                logger.error("stderr: %s", e.stderr)
-            raise
+        """コマンドを実行し stderr をリアルタイムでログに出力する。"""
+        logger.info("Running: %s", " ".join(str(c) for c in cmd))
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        for line in iter(proc.stderr.readline, ""):
+            line = line.rstrip()
+            if line:
+                logger.info("[%s] %s", step_name, line)
+        proc.stderr.close()
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)

@@ -1,6 +1,7 @@
 import subprocess
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import List, Optional
 
@@ -46,7 +47,7 @@ class BWAMapper:
             temp_prefix.parent.mkdir(parents=True, exist_ok=True)
             cmd = self._build_adapter_removal_cmd_paired(fastq1, fastq2, temp_prefix)
             try:
-                subprocess.run(cmd, check=True)
+                self._run_streaming(cmd, f"AdapterRemoval {sample_acc}/{run_id}")
             except subprocess.CalledProcessError as e:
                 logger.error("AdapterRemoval に失敗しました: %s / %s: %s", sample_acc, run_id, e)
                 return None
@@ -71,7 +72,7 @@ class BWAMapper:
             temp_prefix.parent.mkdir(parents=True, exist_ok=True)
             cmd = self._build_adapter_removal_cmd_single(fastq1, temp_prefix)
             try:
-                subprocess.run(cmd, check=True)
+                self._run_streaming(cmd, f"AdapterRemoval {sample_acc}/{run_id}")
             except subprocess.CalledProcessError as e:
                 logger.error("AdapterRemoval に失敗しました: %s / %s: %s", sample_acc, run_id, e)
                 return None
@@ -170,6 +171,25 @@ class BWAMapper:
         return bam
 
     # ------------------------------------------------------------------
+    # ユーティリティ: stderr ストリーミング実行
+    # ------------------------------------------------------------------
+
+    def _run_streaming(self, cmd: list, step_name: str) -> None:
+        """コマンドを実行し stderr をリアルタイムでログに出力する。"""
+        logger.info("Running: %s", " ".join(str(c) for c in cmd))
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        for line in iter(proc.stderr.readline, ""):
+            line = line.rstrip()
+            if line:
+                logger.info("[%s] %s", step_name, line)
+        proc.stderr.close()
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+    # ------------------------------------------------------------------
     # AdapterRemoval コマンド構築
     # ------------------------------------------------------------------
 
@@ -247,7 +267,20 @@ class BWAMapper:
         view_cmd = ["samtools", "view", "-b", "-"]
         sort_cmd = ["samtools", "sort", "-o", str(bam_out), "-"]
         try:
-            bwa_proc = subprocess.Popen(bwa_cmd, stdout=subprocess.PIPE)
+            bwa_proc = subprocess.Popen(
+                bwa_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+
+            def _drain_bwa_stderr() -> None:
+                for raw in bwa_proc.stderr:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    if line:
+                        logger.info("[BWA %s] %s", label, line)
+                bwa_proc.stderr.close()
+
+            stderr_thread = threading.Thread(target=_drain_bwa_stderr, daemon=True)
+            stderr_thread.start()
+
             view_proc = subprocess.Popen(view_cmd, stdin=bwa_proc.stdout, stdout=subprocess.PIPE)
             bwa_proc.stdout.close()
             sort_proc = subprocess.Popen(sort_cmd, stdin=view_proc.stdout)
@@ -262,6 +295,8 @@ class BWAMapper:
             bwa_proc.wait()
             if bwa_proc.returncode != 0:
                 raise subprocess.CalledProcessError(bwa_proc.returncode, bwa_cmd)
+
+            stderr_thread.join(timeout=30)
 
             logger.info("BWA マッピング完了: %s → %s", label, bam_out.name)
             return bam_out

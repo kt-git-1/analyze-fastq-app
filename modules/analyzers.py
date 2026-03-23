@@ -3,8 +3,34 @@ import shlex
 import subprocess
 import logging
 from pathlib import Path
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
+
+
+def _stream_cmd(
+    cmd: List[str],
+    step_name: str,
+    *,
+    env: Optional[dict] = None,
+) -> None:
+    """コマンドを実行し stderr をリアルタイムでログに出力する。"""
+    logger.info("Running: %s", " ".join(str(c) for c in cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    for line in iter(proc.stderr.readline, ""):
+        line = line.rstrip()
+        if line:
+            logger.info("[%s] %s", step_name, line)
+    proc.stderr.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 class MapDamageAnalyzer:
     def __init__(self, config):
@@ -43,9 +69,9 @@ class MapDamageAnalyzer:
             "-r", str(self.config.reference_genome), 
             "-d", str(sample_outdir), "--merge-libraries"
         ]
-        
+
         try:
-            subprocess.run(mapdamage_cmd, check=True)
+            _stream_cmd(mapdamage_cmd, f"mapDamage {sample_acc}")
             logger.info(f"mapDamageが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
@@ -113,7 +139,7 @@ class QualimapAnalyzer:
         # any unsupported -XX arguments so Qualimap can run under Java 17.
         env["JAVA_TOOL_OPTIONS"] = env.get("JAVA_TOOL_OPTIONS", "") + " -XX:+IgnoreUnrecognizedVMOptions"
         try:
-            subprocess.run(qualimap_cmd, check=True, env=env)
+            _stream_cmd(qualimap_cmd, f"Qualimap {sample_acc}", env=env)
             logger.info(f"Qualimapが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
@@ -143,7 +169,7 @@ class HaplotypeCaller:
         ]
         
         try:
-            subprocess.run(haplotypecaller_cmd, check=True)
+            _stream_cmd(haplotypecaller_cmd, f"HaplotypeCaller {sample_acc}")
             logger.info(f"HaplotypeCallerが完了しました: {sample_acc}")
             return vcf_file
         except subprocess.CalledProcessError as e:

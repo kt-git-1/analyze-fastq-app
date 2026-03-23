@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
+from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 from modules.ena_downloader import ENADownloader, verify_file_md5
@@ -92,10 +93,25 @@ def download_via_https(
 
                 r.raise_for_status()
 
-                with open(destination, mode) as f:
+                total_size = int(r.headers.get("Content-Length", 0))
+                initial = destination.stat().st_size if mode == "ab" and destination.exists() else 0
+
+                with (
+                    open(destination, mode) as f,
+                    tqdm(
+                        total=total_size + initial if total_size else None,
+                        initial=initial,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=destination.name,
+                        leave=False,
+                    ) as pbar,
+                ):
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
+                            pbar.update(len(chunk))
 
             if expected_md5 and not verify_file_md5(destination, expected_md5):
                 if attempt < 5:
@@ -161,7 +177,11 @@ def main():
 
     session_dl = build_https_session()
 
-    # サンプル単位で保存: out/PROJECT/SAMPLE/ （main.py の --fastq_dir と互換）
+    total_files = sum(
+        1 for pairs in sample_to_urls.values() for u, _ in pairs if u.endswith(".gz")
+    )
+    file_idx = 0
+
     for sample_acc, url_md5_pairs in sample_to_urls.items():
         sample_dir = project_dir / sample_acc
         sample_dir.mkdir(parents=True, exist_ok=True)
@@ -169,16 +189,21 @@ def main():
         done_flag = sample_dir / ".done"
         if done_flag.exists():
             logging.info(f"SKIP (done): {sample_acc}")
+            file_idx += sum(1 for u, _ in url_md5_pairs if u.endswith(".gz"))
             continue
 
         for u, md5 in url_md5_pairs:
             if not u.endswith(".gz"):
                 continue
+            file_idx += 1
 
             https_url = to_https_url(u)
             filename = Path(urlparse(https_url).path).name
             dest = sample_dir / filename
 
+            logging.info(
+                "[%d/%d] %s / %s", file_idx, total_files, sample_acc, filename,
+            )
             download_via_https(session_dl, https_url, dest, expected_md5=md5)
 
         done_flag.touch()
