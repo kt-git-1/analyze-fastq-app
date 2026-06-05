@@ -2,6 +2,7 @@ import pysam
 import subprocess
 import logging
 from pathlib import Path
+from typing import Optional
 
 from tqdm import tqdm
 
@@ -65,7 +66,7 @@ class SoftClipper:
 
         return read
 
-    def _count_reads(self, bam_path: Path) -> int | None:
+    def _count_reads(self, bam_path: Path) -> Optional[int]:
         """samtools view -c でリード数を高速カウントする。"""
         try:
             result = subprocess.run(

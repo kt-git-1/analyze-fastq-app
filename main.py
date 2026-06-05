@@ -317,7 +317,7 @@ def main() -> None:
         sys.exit(1)
 
     # 4. リファレンスゲノムのインデックスを作成
-    fai = config.reference_genome.with_suffix(".fai")
+    fai = Path(str(config.reference_genome) + ".fai")
     if not fai.exists():
         logger.info("リファレンスゲノムのインデックスを作成します")
         subprocess.run(["samtools", "faidx", str(config.reference_genome)], check=True)

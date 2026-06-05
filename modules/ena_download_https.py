@@ -3,6 +3,7 @@ import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from urllib.parse import urlparse
 
 import requests
@@ -53,7 +54,7 @@ def download_via_https(
     url: str,
     destination: Path,
     chunk_size: int = 1024 * 1024,
-    expected_md5: str | None = None,
+    expected_md5: Optional[str] = None,
 ) -> Path:
     """HTTPS ダウンロード（再開対応・MD5 検証付き）"""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -96,18 +97,15 @@ def download_via_https(
                 total_size = int(r.headers.get("Content-Length", 0))
                 initial = destination.stat().st_size if mode == "ab" and destination.exists() else 0
 
-                with (
-                    open(destination, mode) as f,
-                    tqdm(
-                        total=total_size + initial if total_size else None,
-                        initial=initial,
-                        unit="B",
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        desc=destination.name,
-                        leave=False,
-                    ) as pbar,
-                ):
+                with open(destination, mode) as f, tqdm(
+                    total=total_size + initial if total_size else None,
+                    initial=initial,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=destination.name,
+                    leave=False,
+                ) as pbar:
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
