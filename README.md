@@ -1,52 +1,24 @@
-## 概要
+# analyze-fastq-app
 
-**analyze-fastq-app** は、FASTQ の取得からマッピング、QC、VCF 出力までを一括実行する NGS 解析パイプラインです。
+FASTQ の取得、前処理、BWA マッピング、BAM 処理、QC、VCF 出力までをまとめて実行する NGS 解析パイプラインです。ENA project accession、ローカル FASTQ、既存 dedup BAM の 3 種類を入口として使えます。
 
-主な処理は次の通りです。
+古 DNA と現代 DNA の両方を想定しており、FASTQ から解析する場合は `--data_type ancient|modern` で AdapterRemoval / BWA 周りの処理を切り替えます。
 
-1. ENA から FASTQ をダウンロード、またはローカル FASTQ を読み込む
-2. AdapterRemoval + BWA で BAM を作成する
-3. Soft clipping と BAM 前処理（重複除去）を行う
-4. mapDamage / Qualimap / GATK HaplotypeCaller を実行する
-5. 中間ファイルを削除し、結果を整理して保存する
+## できること
 
-古 DNA と現代 DNA の両方を想定しており、`--data_type` により挙動を切り替えられます。
+- ENA から FASTQ をダウンロードして解析する
+- HTTPS ダウンロードだけを先に実行し、解析と分けて運用する
+- ローカル FASTQ を sample / run / R1 / R2 / single に自動分類する
+- AdapterRemoval + BWA MEM で sorted BAM を作成する
+- ancient paired-end では collapsed / non-collapsed reads を分けてマッピングし、BAM をマージする
+- BAM に soft clipping、CleanSam、sample 単位 merge、MarkDuplicates、sort、index を行う
+- 既存 dedup BAM から mapDamage / Qualimap / HaplotypeCaller だけを実行する
+- `.done` チェックポイントで完了済みサンプルをスキップし、途中から再開する
+- `--parallel_samples` でサンプル単位に並列実行する
 
----
+## Quick Start
 
-## 目次
-
-- [概要](#概要)
-- [このパイプラインでできること](#このパイプラインでできること)
-- [Quick Start](#quickstart)
-- [入力と出力](#入力と出力)
-- [ワークフロー](#ワークフロー)
-- [FASTQ 判定ルール](#fastq-判定ルール)
-- [実行オプション](#実行オプション)
-- [セットアップ](#セットアップ)
-- [ディレクトリ構成](#ディレクトリ構成)
-- [各モジュールの役割](#各モジュールの役割)
-- [トラブルシューティング](#トラブルシューティング)
-
----
-
-## このパイプラインでできること
-
-- ENA の project accession から FASTQ を取得する
-- 手元の FASTQ ディレクトリを sample 単位に自動認識する
-- 複数レーンの FASTQ をサンプル単位に統合する
-- AdapterRemoval と BWA を用いて BAM を作成する
-- Soft clipping、重複除去、index 作成を行う
-- mapDamage、Qualimap、HaplotypeCaller の結果をまとめて出力する
-- 解析後に不要な中間 BAM を自動削除して容量を節約する
-- 完了済みサンプルをスキップして途中から再開できる（チェックポイント機構）
-- 複数サンプルを並列に解析できる
-
----
-
-## QuickStart
-
-### ENA からダウンロードしてそのまま解析
+### ENA からダウンロードして解析
 
 ```sh
 python main.py \
@@ -55,301 +27,274 @@ python main.py \
   --reference_genome ./data/reference/equCab3.nochrUn.fa
 ```
 
-### 手元の FASTQ を解析
+### ローカル FASTQ を解析
 
 ```sh
 python main.py \
   --fastq_dir ./my_fastqs \
   --reference_genome ./data/reference/equCab3.nochrUn.fa
 ```
+
+### 既存 dedup BAM から QC / VCF だけ実行
+
+```sh
+python main.py \
+  --bam_dir ./my_dedup_bams \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa
+```
+
+`--bam_dir` 指定時は FASTQ 判定、AdapterRemoval、BWA、soft clipping、CleanSam、MarkDuplicates を実行しません。入力 BAM は既に重複除去・sort 済みの dedup BAM として扱います。
 
 ### ダウンロードと解析を分ける
 
 ```sh
 # Step 1: HTTPS でダウンロード
-python -m modules.ena_download_https --project PRJEB19970 --out ./data/raw_data --workers 2
+python -m modules.ena_download_https \
+  --project PRJEB19970 \
+  --out ./data/raw_data \
+  --workers 2
 
 # Step 2: ダウンロード済み FASTQ を解析
-python main.py --fastq_dir ./data/raw_data/PRJEB19970 --base_dir ./data
+python main.py \
+  --fastq_dir ./data/raw_data/PRJEB19970 \
+  --base_dir ./data \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa
 ```
 
-### 並列実行
+### サンプル並列実行
 
 ```sh
 python main.py \
   --fastq_dir ./my_fastqs \
   --reference_genome ./data/reference/equCab3.nochrUn.fa \
-  --parallel_samples 3
+  --parallel_samples 3 \
+  --threads 8
 ```
 
-各サンプルが `--threads` 本のスレッドを使うため、合計スレッド数は `parallel_samples × threads` になります。マシンのコア数とメモリに応じて調整してください。
+各サンプルが `--threads` 本のスレッドを使います。合計負荷はおおむね `parallel_samples × threads` です。
 
----
+## 入力モード
 
-## 入力と出力
+| モード | 主な引数 | 実行される処理 |
+| ---- | ---- | ---- |
+| ENA から解析 | `--project_accession`, `--download-via-https` | HTTPS ダウンロード → FASTQ 解析 |
+| ENA API + HTTP/FTP ダウンロード | `--project_accession` | ENA メタデータ取得 → FASTQ ダウンロード → FASTQ 解析 |
+| ローカル FASTQ | `--fastq_dir` | FASTQ 自動判定 → 前処理 → BAM → QC → VCF |
+| 既存 dedup BAM | `--bam_dir --bam_stage dedup` | BAM index 確認 → mapDamage → Qualimap → HaplotypeCaller |
 
-### 入力
+`--bam_dir` は `--fastq_dir` および `--download-via-https` と同時指定できません。
 
-- ENA の project accession
-  - 例: `PRJEB19970`
-- またはローカル FASTQ ディレクトリ
-  - 例: `./my_fastqs`
-- 参照ゲノム FASTA
-  - 例: `./data/reference/equCab3.nochrUn.fa`
-
-### 出力
-
-主な出力先は次の通りです。
-
-- ログ: `data/logs/pipeline_<project>.log`
-- ダウンロード FASTQ: `data/raw_data/<project>/`
-- サンプルごとの解析結果: `data/results/<project>/<sample>/`
-- VCF: `data/results/<project>/<sample>/vcf_files/`
-- mapDamage や Qualimap の結果: 各 sample ディレクトリ配下
-- チェックポイント: `data/results/<project>/<sample>/.done`
-
----
-
-## ワークフロー
-
-このプログラムは「FASTQ を入力にして、サンプルごとに BAM と QC と VCF を作る」ものです。最初に理解するとよいのは、入口が 2 つあることです。
-
-1. ENA から始める
-2. 手元の FASTQ から始める
-
-### 例 1: ENA から始める
-
-```sh
-python main.py \
-  --project_accession PRJEB19970 \
-  --download-via-https \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
-```
-
-内部では次の順で処理されます。
-
-1. `ena_download_https.py` が FASTQ をダウンロードする
-2. ダウンロード済み FASTQ を sample ごとに見つける
-3. 複数レーンがあれば 1 サンプル 1 セットにまとめる
-4. 外部ツール・BWA インデックス・Picard jar の存在を事前検証する
-5. AdapterRemoval を実行する
-6. BWA で BAM を作る
-7. Soft clipping を行う
-8. Picard / samtools で重複除去と index 作成を行う（中間 BAM は各ステップ後に削除）
-9. mapDamage を重複除去済み BAM に対して実行する
-10. Qualimap / HaplotypeCaller を実行する
-11. 中間ファイルを削除し、`.done` チェックポイントを記録して終了する
-
-### 例 2: 手元の FASTQ から始める
-
-たとえば次のような FASTQ があるとします。
-
-```text
-my_fastqs/
-  SAMPLE_A_L001_R1_001.fastq.gz
-  SAMPLE_A_L001_R2_001.fastq.gz
-  SAMPLE_A_L002_R1_001.fastq.gz
-  SAMPLE_A_L002_R2_001.fastq.gz
-  SAMPLE_B_R1.fastq.gz
-  SAMPLE_B_R2.fastq.gz
-```
-
-この場合は次のように実行します。
-
-```sh
-python main.py \
-  --fastq_dir ./my_fastqs \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
-```
-
-内部では次のように解釈されます。
-
-- `SAMPLE_A` は 2 レーン分の paired-end データ
-- `SAMPLE_B` は 1 レーン分の paired-end データ
-- `SAMPLE_A` の 2 レーンは 1 本の `R1` と 1 本の `R2` に統合される
-- その後、各 sample に対して同じ解析が行われる
-
-### 全体の流れ
+## FASTQ 解析ワークフロー
 
 ```text
 FASTQ
   ↓
-sample / R1 / R2 を判定          ← modules/fastq_parser.py
+sample / run / R1 / R2 / single を判定
   ↓
-レーンを統合                      ← modules/fastq_parser.py
+run 単位の処理
+  AdapterRemoval
   ↓
-環境検証（外部ツール・インデックス） ← config.py
+  BWA MEM + samtools sort
   ↓
-┌─── サンプルごとのループ（並列実行可能）───┐
-│                                           │
-│  AdapterRemoval                           │
-│    ↓                                      │
-│  BWA mapping                              │
-│    ↓                                      │
-│  Soft clipping                            │
-│    ↓                                      │
-│  BAM 前処理（CleanSam → ReadGroup →       │
-│   MarkDuplicates → sort → index）         │
-│    ↓                                      │
-│  mapDamage（重複除去済み BAM を使用）       │
-│    ↓                                      │
-│  Qualimap / HaplotypeCaller               │
-│    ↓                                      │
-│  中間ファイル削除 → .done 記録            │
-└───────────────────────────────────────────┘
+  soft clipping
   ↓
-サマリー出力（成功/失敗サンプル一覧）
+  Picard CleanSam
+  ↓
+sample 単位の処理
+  samtools merge
+  ↓
+  Picard MarkDuplicates
+  ↓
+  samtools sort / index
+  ↓
+  mapDamage
+  ↓
+  Qualimap
+  ↓
+  GATK HaplotypeCaller
+  ↓
+.done 作成
 ```
+
+FASTQ から作成された最終 dedup BAM と index は、QC / VCF 完了後に中間ファイルとして削除されます。
 
 ### ancient と modern の違い
 
-- `ancient`
-  - AdapterRemoval で `--collapse` を使う（minquality=20, minlength=30）
-  - collapsed と non-collapsed を分けてマッピングし、最後にマージする
-- `modern`
-  - 通常の paired-end / single-end として処理する（minquality=25, minlength=25）
-
-迷った場合は、古 DNA なら `ancient`、通常の現代サンプルなら `modern` を選べば十分です。
-
-### チェックポイントと再開
-
-各サンプルの解析が成功すると `data/results/<project>/<sample>/.done` が作成されます。再実行時はこのファイルが存在するサンプルをスキップするため、途中で失敗しても最初からやり直す必要はありません。
-
-すべてのサンプルを強制的に再実行するには `--force` を指定します。
-
-### 初回実行時に見る場所
-
-まずは次の 3 点を確認すると全体像を掴みやすいです。
-
-1. `data/logs/pipeline_<project>.log` に各ステップの開始と終了が出ているか
-2. `data/results/<project>/<sample>/` が sample ごとに作られているか
-3. `vcf_files` や QC 出力が生成されているか
-
----
+| `--data_type` | AdapterRemoval | マッピング |
+| ---- | ---- | ---- |
+| `ancient` | `--minquality 20 --minlength 30 --collapse` | collapsed reads を single-end、non-collapsed reads を paired-end としてマッピングし、run 内でマージ |
+| `modern` | `--minquality 25 --minlength 25` | 通常の paired-end / single-end としてマッピング |
 
 ## FASTQ 判定ルール
 
-`--fastq_dir` を指定した場合、`parse_fastq_general()` がディレクトリを再帰探索し、各 FASTQ を sample ごとに `R1` / `R2` / `single` に分類します。
+`--fastq_dir` 配下を再帰探索し、次の拡張子を対象にします。
 
-### 対象ファイル
+- `.fastq`
+- `.fastq.gz`
+- `.fq`
+- `.fq.gz`
 
-- `*.fastq`
-- `*.fastq.gz`
-- `*.fq`
-- `*.fq.gz`
+対応している主な命名規則:
 
-### read 種別の判定
-
-次のような命名規則に対応しています。
-
-- Illumina 形式: `SAMPLE_A_L001_R1_001.fastq.gz`
-- Filgen 形式: `Horse01_L1_1.fq.gz`
-- 一般的な `R1/R2` 形式: `sampleB_R1.fastq.gz`, `sampleB-R2.fastq.gz`
-- 数字だけのペア形式: `sampleC_1.fq.gz`, `sampleC_2.fq.gz`
-- どれにも当てはまらない場合は `single`
-
-例:
-
-- `SAMPLE_A_L001_R1_001.fastq.gz` と `SAMPLE_A_L002_R1_001.fastq.gz` は `SAMPLE_A` の `R1`
-- `SAMPLE_A_L001_R2_001.fastq.gz` と `SAMPLE_A_L002_R2_001.fastq.gz` は `SAMPLE_A` の `R2`
-- `ERR123456.fastq.gz` は `ERR123456` の `single`
-
-### sample 名の決め方
+| 形式 | 例 | 判定 |
+| ---- | ---- | ---- |
+| Illumina | `SAMPLE_A_L001_R1_001.fastq.gz` | sample=`SAMPLE_A`, run=`SAMPLE_A_L001`, read=`R1` |
+| Filgen | `Horse01_L1_1.fq.gz` | sample=`Horse01`, run=`Horse01_L1`, read=`R1` |
+| R1/R2 | `sampleB_R1.fastq.gz`, `sampleB-R2.fastq.gz` | paired-end |
+| `_1/_2` | `sampleC_1.fq.gz`, `sampleC_2.fq.gz` | paired-end |
+| その他 | `ERR123456.fastq.gz` | single-end |
 
 sample 名は次の優先順位で決まります。
 
-1. サブディレクトリ配下にある場合は最上位ディレクトリ名
-2. そうでない場合はファイル名から推定した sample 名
-3. それも取れない場合は拡張子を除いたファイル名
+1. FASTQ がサブディレクトリ配下にある場合は、`--fastq_dir` 直下の最上位ディレクトリ名
+2. ファイル名から推定した sample 名
+3. FASTQ 拡張子を除いたファイル名
 
-たとえば次のような構成では、ファイル名よりディレクトリ名が優先されます。
+run ID は次の優先順位で決まります。
+
+1. `sample/run/file.fastq.gz` のように 3 階層以上ある場合は、FASTQ の直上ディレクトリ名
+2. ファイル名から推定した lane 付き run 名
+3. sample 名
+
+同じ sample/run に paired-end と single-end が混在する場合は paired-end を優先し、single-end は無視します。
+
+## BAM 入力モード
+
+`--bam_dir` を指定すると、既存 dedup BAM から QC / VCF だけを実行します。v1 では `--bam_stage dedup` のみ対応しています。
 
 ```text
-my_fastqs/
-  nested_sample/
-    reads_1.fastq.gz
-    reads_2.fastq.gz
+dedup BAM
+  ↓
+sample 名をファイル名から推定
+  ↓
+BAM index 確認 / 必要なら samtools index
+  ↓
+mapDamage
+  ↓
+Qualimap
+  ↓
+GATK HaplotypeCaller
+  ↓
+.done 作成
 ```
 
-この場合、`reads_1.fastq.gz` / `reads_2.fastq.gz` は `nested_sample` に分類されます。
+### BAM の検出
 
-### レーンのマージ
+デフォルトでは `--bam_dir` 配下の `*.bam` を再帰探索します。対象を絞る場合は `--bam_pattern` を指定します。
 
-`merge_lanes_by_cat()` は sample ごとの複数レーンを統合します。
+```sh
+python main.py \
+  --bam_dir ./my_dedup_bams \
+  --bam_pattern "*.dedup.sorted.bam" \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa
+```
 
-- `R1` が複数本あれば 1 本に連結
-- `R2` が複数本あれば 1 本に連結
-- single-end が複数本あれば 1 本に連結
-- paired-end と single-end が混在する場合は paired-end を優先
+### sample 名の推定
 
-最終的に、下流処理には sample ごとに `[R1, R2]` または `[single]` の形で渡されます。
+sample 名は BAM ファイル名から推定します。次の suffix を取り除いた残りが sample 名です。
 
----
+| BAM ファイル名 | sample 名 |
+| ---- | ---- |
+| `SAMPLE_A.dedup.sorted.bam` | `SAMPLE_A` |
+| `SAMPLE_B.sorted.bam` | `SAMPLE_B` |
+| `SAMPLE_C.dedup.bam` | `SAMPLE_C` |
+| `SAMPLE_D.bam` | `SAMPLE_D` |
+
+同じ sample 名に解釈される BAM が複数見つかった場合はエラー終了します。
+
+### BAM index
+
+`<input>.bam.bai` または `<input>.bai` が存在すれば既存 index を使います。どちらも存在しない場合は `samtools index <input>.bam` を実行します。
+
+入力 BAM と既存 index は削除されません。
+
+## 出力
+
+主な出力先:
+
+```text
+data/
+  raw_data/<project>/                 # ダウンロード FASTQ
+  results/<project>/<sample>/
+    mapdamage/
+    qualimap/
+    vcf_files/
+      <sample>.vcf
+    .done
+  logs/
+    pipeline_<project>.log
+  temp/
+```
+
+`<project>` は通常 `--project_accession` です。`--fastq_dir` 指定時は FASTQ ディレクトリ名、`--bam_dir` 指定時は BAM ディレクトリ名が使われます。
+
+## チェックポイントと再開
+
+各 sample の解析が成功すると、`data/results/<project>/<sample>/.done` が作成されます。再実行時は `.done` がある sample をスキップします。
+
+全 sample を強制的に再実行する場合:
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --force
+```
+
+BAM 入力モードでも同じ仕組みで `.done` を使います。
 
 ## 実行オプション
 
-`main.py` は次の引数を受け取ります。
-
 | 引数 | 説明 | デフォルト |
-| ---- | ---- | ---------- |
-| `--project_accession` | ENA の project ID。`--fastq_dir` を指定しない場合に使用 | `PRJEB19970` |
-| `--base_dir` | データ保存先のベースディレクトリ | `./data` |
+| ---- | ---- | ---- |
+| `--project_accession` | ENA project accession | `PRJEB19970` |
+| `--base_dir` | `raw_data`, `results`, `logs`, `temp` を置くベースディレクトリ | `./data` |
 | `--reference_genome` | 参照ゲノム FASTA | `./data/reference/equCab3.nochrUn.fa` |
-| `--workers` | ダウンロード時の並列数 | `4` |
-| `--download_protocol` | ダウンロードプロトコル (`ftp` / `http`) | `http` |
+| `--fastq_dir` | ローカル FASTQ ディレクトリ | `None` |
+| `--bam_dir` | 既存 dedup BAM ディレクトリ | `None` |
+| `--bam_stage` | 入力 BAM の処理段階。v1 では `dedup` のみ | `dedup` |
+| `--bam_pattern` | `--bam_dir` 配下で検出する BAM の glob パターン | `*.bam` |
+| `--download-via-https` | HTTPS ダウンロード後に解析する | `False` |
+| `--download_protocol` | ENA 通常ダウンロードで使うプロトコル (`ftp` / `http`) | `http` |
+| `--workers` | ダウンロード並列数 | `4` |
 | `--max_retries` | ダウンロード失敗時の再試行回数 | `3` |
-| `--threads` | 解析に使うスレッド数 | `20` |
-| `--java_mem` | Java ツール用メモリ | `10g` |
-| `--fastq_dir` | 事前にダウンロードした FASTQ ディレクトリ | `None` |
-| `--download-via-https` | HTTPS ダウンロードしてから解析を実行 | `False` |
-| `--data_type` | `ancient` または `modern` | `ancient` |
-| `--force` | 完了済みサンプルのチェックポイント (`.done`) を無視して再実行 | `False` |
-| `--picard_jar` | Picard jar ファイルのパス | `/usr/local/bin/picard.jar` |
-| `--rg_library` | リードグループのライブラリ名 (RGLB) | `unknown` |
-| `--rg_center` | リードグループのシーケンシングセンター名 (RGCN) | `unknown` |
-| `--parallel_samples` | 同時に解析するサンプル数。合計スレッド数は `parallel_samples × threads` | `1` |
-
----
+| `--data_type` | FASTQ 解析時のデータ種別 (`ancient` / `modern`) | `ancient` |
+| `--threads` | 解析ツールに渡すスレッド数 | `20` |
+| `--parallel_samples` | 同時に解析する sample 数 | `1` |
+| `--java_mem` | Picard など Java ツール用メモリ | `10g` |
+| `--picard_jar` | Picard jar のパス | `/usr/local/bin/picard.jar` |
+| `--rg_library` | BWA read group の library (`LB`) | `unknown` |
+| `--rg_center` | BWA read group の center (`CN`) | `unknown` |
+| `--force` | `.done` を無視して再実行する | `False` |
 
 ## セットアップ
 
-### 必要条件
-
-- Python 3.8 以上
-- BWA
-- samtools
-- AdapterRemoval
-- Picard (jar ファイル)
-- mapDamage
-- Qualimap
-- GATK
-- pysam
-- 参照ゲノム FASTA + BWA インデックス
-
-### Conda 環境
+### Python / conda
 
 ```sh
 conda env create -f environment.yml
 conda activate analyze-env
 ```
 
-`environment.yml` には Python 側依存が含まれます。外部ツールは各環境で別途インストールしてください。
+### 外部ツール
 
-### Picard
+パイプライン起動時に次のツールとファイルを検証します。
 
-Picard のデフォルトパスは `/usr/local/bin/picard.jar` です。別の場所にある場合は `--picard_jar` オプションで指定してください。
+- `bwa`
+- `samtools`
+- `AdapterRemoval`
+- `java`
+- `gatk`
+- `qualimap`
+- `mapDamage`
+- Picard jar
+- 参照ゲノム FASTA
+- BWA index (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`)
 
-### 環境検証
+参照ゲノムの `.fai` がない場合は `samtools faidx` で自動作成します。
 
-パイプライン起動時に `validate_environment()` が自動実行され、以下をまとめて検証します。
-
-- 外部ツールが PATH に存在するか (`bwa`, `samtools`, `AdapterRemoval`, `java`, `gatk`, `qualimap`, `mapDamage`)
-- Picard jar ファイルが存在するか
-- BWA インデックスファイル (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`) が存在するか
-
-不足があればすべてリストアップした上でエラー終了します。
-
----
+注意: BAM 入力モードでも、現状の環境検証は FASTQ 解析用ツールを含めて確認します。
 
 ## ディレクトリ構成
 
@@ -360,6 +305,7 @@ analyze-fastq-app/
 ├── main.py
 ├── modules/
 │   ├── analyzers.py
+│   ├── bam_parser.py
 │   ├── bam_processor.py
 │   ├── bwa_mapper.py
 │   ├── ena_downloader.py
@@ -367,61 +313,44 @@ analyze-fastq-app/
 │   ├── fastq_parser.py
 │   ├── softclipper.py
 │   └── __init__.py
-├── data/
-│   ├── raw_data/
-│   ├── reference/
-│   ├── results/
-│   ├── logs/
-│   └── temp/
 └── README.md
 ```
 
----
+## モジュール概要
 
-## 各モジュールの役割
-
-- `main.py`: パイプライン全体の制御。サンプルごとの解析を逐次または並列で実行し、完了サマリーを出力する
-- `config.py`: コマンドライン引数の解析、ログ設定、環境検証 (`validate_environment`)、中間ファイル削除ユーティリティ
-- `modules/fastq_parser.py`: FASTQ ファイルの検出・サンプル分類・レーン統合
-- `modules/ena_downloader.py`: ENA Portal API からメタデータを取得し、FTP/HTTP で FASTQ をダウンロード（並列・リトライ対応）
-- `modules/ena_download_https.py`: HTTPS ダウンロード専用 CLI。レジューム対応・`.done` フラグによるスキップ機構付き
-- `modules/bwa_mapper.py`: AdapterRemoval によるアダプター除去・品質トリミングと BWA MEM によるマッピング。ancient モードでは collapsed/non-collapsed を分離処理してマージ
-- `modules/softclipper.py`: BAM の先頭 5bp をソフトクリップ（古代 DNA の末端損傷対策）
-- `modules/bam_processor.py`: Picard CleanSam → AddOrReplaceReadGroups → MarkDuplicates (重複除去) → samtools sort → index。各ステップ後に中間 BAM を自動削除
-- `modules/analyzers.py`: mapDamage（重複除去済み BAM に対して実行）、Qualimap（HTML レポート）、GATK HaplotypeCaller（VCF 出力）
-
----
+- `main.py`: 入力モードの切り替え、sample 単位の逐次/並列実行、完了サマリー出力
+- `config.py`: CLI 引数、ディレクトリ設定、ログ設定、環境検証、中間ファイル削除
+- `modules/fastq_parser.py`: FASTQ の再帰探索、sample / run / read 分類
+- `modules/bam_parser.py`: 既存 BAM の再帰探索、sample 名推定、重複 sample 検出
+- `modules/ena_downloader.py`: ENA Portal API 取得、FTP/HTTP ダウンロード、MD5 検証
+- `modules/ena_download_https.py`: HTTPS ダウンロード専用 CLI、レジューム、`.done` スキップ
+- `modules/bwa_mapper.py`: AdapterRemoval、BWA MEM、samtools sort、ancient paired-end の collapsed/non-collapsed merge
+- `modules/softclipper.py`: BAM read の先頭 5bp soft clipping
+- `modules/bam_processor.py`: CleanSam、sample 単位 merge、MarkDuplicates、sort、index
+- `modules/analyzers.py`: mapDamage、Qualimap、GATK HaplotypeCaller
 
 ## トラブルシューティング
 
-### 起動直後に環境検証で止まる
+### 起動直後に止まる
 
-`validate_environment()` がツールやインデックスの不足を検出しています。エラーメッセージに表示されたツール/ファイルを確認してください。
+環境検証で不足ツールや不足ファイルが見つかっています。ログに表示されたツール、Picard jar、参照ゲノム、BWA index を確認してください。
 
-### 外部コマンドが見つからない
+### FASTQ が見つからない
 
-`bwa`, `samtools`, `AdapterRemoval` などが `PATH` に入っているか確認してください。macOS では Homebrew、Linux では conda やパッケージマネージャ経由での導入が一般的です。
+`--fastq_dir` のパスと拡張子を確認してください。対象は `.fastq`, `.fastq.gz`, `.fq`, `.fq.gz` です。
 
-### データがダウンロードできない
+### BAM 入力モードで sample 名が重複する
 
-project ID やネットワーク接続を確認してください。ENA へのアクセスは `ENADownloader.get_api_response()` と `ena_download_https.py` で行っています。
+たとえば `SAMPLE_A.bam` と `SAMPLE_A.sorted.bam` はどちらも `SAMPLE_A` と解釈されるためエラーになります。`--bam_pattern` で対象を絞るか、片方を別ディレクトリへ移動してください。
 
-### BAM や VCF が出力されない
+### BAM index 作成に失敗する
 
-`data/logs/pipeline_<project>.log` を確認してください。どのステップで止まったかを追えます。パイプライン終了時に成功/失敗サンプルのサマリーがログに出力されます。
+入力 BAM が壊れていないか、coordinate sort 済みか、参照ゲノムと整合しているかを確認してください。必要なら事前に `samtools quickcheck` や `samtools index` で確認してください。
 
-### 途中で失敗したサンプルだけ再実行したい
+### 途中で失敗した sample だけ再実行したい
 
-そのまま同じコマンドを再実行してください。完了済みサンプル (`.done` が存在するもの) はスキップされ、失敗したサンプルだけが再実行されます。全サンプルを強制的にやり直すには `--force` を指定します。
+同じコマンドを再実行してください。`.done` がある sample はスキップされ、未完了 sample だけ実行されます。すべてやり直す場合は `--force` を指定します。
 
 ### Qualimap で `MaxPermSize` エラーが出る
 
-Java 9 以降では `-XX:MaxPermSize` は廃止されています。`JAVA_TOOL_OPTIONS=-XX:+IgnoreUnrecognizedVMOptions` を使ってください。`QualimapAnalyzer` 側でも自動付与しています。
-
-### ローカル FASTQ の命名ルールに合わない
-
-`modules/fastq_parser.py` の `_classify_fastq_name()` に正規表現を追加してください。現在は Illumina、Filgen、一般的な `R1/R2`、`_1/_2` を扱えます。
-
----
-
-詳細なパラメータは各モジュールの docstring を参照してください。問い合わせ先は Issue または開発者までお願いします。
+Java 9 以降では `-XX:MaxPermSize` が廃止されています。`QualimapAnalyzer` は `JAVA_TOOL_OPTIONS=-XX:+IgnoreUnrecognizedVMOptions` を自動付与します。

@@ -20,9 +20,12 @@ class PipelineConfig:
         self.args = args
         self.script_dir = Path(__file__).parent.resolve()
         self.base_dir: Path = args.base_dir
-        # 2. fastq_dirが指定されている場合は project_accessionを上書き
+        # 2. fastq_dir/bam_dir が指定されている場合は project_accession を上書き
         self.fastq_dir: Optional[Path] = args.fastq_dir
-        if self.fastq_dir:
+        self.bam_dir: Optional[Path] = args.bam_dir
+        if self.bam_dir:
+            self.project_accession = self.bam_dir.name
+        elif self.fastq_dir:
             self.project_accession = self.fastq_dir.name
         else:
             self.project_accession = args.project_accession
@@ -166,6 +169,29 @@ def parse_args() -> argparse.Namespace:
             "このディレクトリからペアエンドの FASTQ ファイルを直接読み込みます。"
         ),
     )
+    # BAM ディレクトリ（ローカル、dedup BAM 入力）
+    parser.add_argument(
+        "--bam_dir",
+        type=Path,
+        default=None,
+        help=(
+            "既存の dedup BAM ファイルが存在するディレクトリへのパス。"
+            "指定すると、FASTQ からの前処理をスキップして QC/VCF のみ実行します。"
+        ),
+    )
+    parser.add_argument(
+        "--bam_stage",
+        type=str,
+        default="dedup",
+        choices=["dedup"],
+        help="入力 BAM の処理段階。v1 では dedup のみ対応します。",
+    )
+    parser.add_argument(
+        "--bam_pattern",
+        type=str,
+        default="*.bam",
+        help="--bam_dir 配下で検出する BAM ファイルの glob パターン (デフォルト: *.bam)",
+    )
     # データ種別
     parser.add_argument(
         "--data_type",
@@ -218,7 +244,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="ena_download_https でダウンロードしてから解析を実行（再開対応・HTTPS）",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.bam_dir and args.fastq_dir:
+        parser.error("--bam_dir と --fastq_dir は同時に指定できません")
+    if args.bam_dir and args.download_via_https:
+        parser.error("--bam_dir と --download-via-https は同時に指定できません")
+    return args
 
 
 def setup_logging(log_file: Path) -> logging.Logger:

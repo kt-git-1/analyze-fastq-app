@@ -15,6 +15,7 @@ from config import (
     cleanup_intermediate_file,
 )
 from modules.fastq_parser import group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
+from modules.bam_parser import group_bams_by_sample
 from modules.ena_downloader import ENADownloader, verify_file_md5
 from modules.bwa_mapper import BWAMapper
 from modules.softclipper import SoftClipper
@@ -26,6 +27,22 @@ from modules.analyzers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_bam_index(bam_path: Path) -> bool:
+    """Create a BAM index next to the BAM if it does not already exist."""
+    bai_path = Path(str(bam_path) + ".bai")
+    alternate_bai_path = bam_path.with_suffix(".bai")
+    if bai_path.exists() or alternate_bai_path.exists():
+        return True
+
+    logger.info("BAM index が見つからないため作成します: %s", bai_path)
+    try:
+        subprocess.run(["samtools", "index", str(bam_path)], check=True)
+        return True
+    except subprocess.CalledProcessError:
+        logger.exception("BAM index の作成に失敗しました: %s", bam_path)
+        return False
 
 
 # ============================================================
@@ -184,6 +201,77 @@ def process_sample(
     return sample_acc, True, ""
 
 
+def process_sample_from_dedup_bam(
+    sample_acc: str,
+    dedup_bam: Path,
+    config: PipelineConfig,
+) -> Tuple[str, bool, str]:
+    """
+    既存 dedup BAM から QC と VCF 出力のみを実行する。
+
+    FASTQ 由来の前処理は行わず、入力 BAM は削除しない。
+    """
+    done_flag = config.results_dir / sample_acc / ".done"
+    force: bool = getattr(config.args, "force", False)
+
+    if done_flag.exists() and not force:
+        logger.info("スキップ (完了済み): %s", sample_acc)
+        return sample_acc, True, ""
+
+    if not dedup_bam.exists() or not dedup_bam.is_file():
+        logger.error("BAM ファイルが見つかりません: %s", dedup_bam)
+        return sample_acc, False, "BAM missing"
+
+    if dedup_bam.stat().st_size == 0:
+        logger.error("BAM ファイルが空です: %s", dedup_bam)
+        return sample_acc, False, "BAM empty"
+
+    if not _ensure_bam_index(dedup_bam):
+        return sample_acc, False, "samtools index"
+
+    mapdamage_analyzer = MapDamageAnalyzer(config)
+    qualimap_analyzer = QualimapAnalyzer(config)
+    haplotypecaller = HaplotypeCaller(config)
+
+    total_steps = 3
+    current_step = 0
+
+    def _log_progress(step_name: str) -> None:
+        nonlocal current_step
+        current_step += 1
+        pct = int(current_step / total_steps * 100)
+        logger.info(
+            "[%s] %d%% (%d/%d) %s",
+            sample_acc, pct, current_step, total_steps, step_name,
+        )
+
+    logger.info("既存 dedup BAM から解析を開始します: %s (%s)", sample_acc, dedup_bam)
+
+    _log_progress("mapDamage")
+    mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
+    if not mapdamage_result:
+        logger.error("mapDamage に失敗しました: %s", sample_acc)
+        return sample_acc, False, "mapDamage"
+
+    _log_progress("Qualimap")
+    qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
+    if not qualimap_result:
+        logger.error("Qualimap に失敗しました: %s", sample_acc)
+        return sample_acc, False, "Qualimap"
+
+    _log_progress("HaplotypeCaller")
+    vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
+    if not vcf_file:
+        logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+        return sample_acc, False, "HaplotypeCaller"
+
+    done_flag.parent.mkdir(parents=True, exist_ok=True)
+    done_flag.touch()
+
+    logger.info("既存 dedup BAM からの解析を完了しました: %s", sample_acc)
+    return sample_acc, True, ""
+
+
 # ============================================================
 # メインパイプライン
 # ============================================================
@@ -240,7 +328,32 @@ def main() -> None:
     session = requests.Session()
 
     # 6. データソースを決定
-    if config.fastq_dir:
+    bam_mode = config.bam_dir is not None
+    sample_to_bams: Dict[str, Path] = {}
+
+    if config.bam_dir:
+        if not config.bam_dir.exists() or not config.bam_dir.is_dir():
+            logger.error(
+                "指定された BAM ディレクトリが存在しないか、ディレクトリではありません: %s",
+                config.bam_dir,
+            )
+            sys.exit(1)
+
+        logger.info("既存 dedup BAM ファイルを使用します: %s", config.bam_dir)
+        try:
+            sample_to_bams = group_bams_by_sample(config.bam_dir, config.args.bam_pattern)
+        except ValueError as exc:
+            logger.error("BAM ファイルの検出に失敗しました: %s", exc)
+            sys.exit(1)
+
+        if not sample_to_bams:
+            logger.error("BAM ファイルが見つかりませんでした: %s", config.bam_dir)
+            sys.exit(1)
+
+        for sa, bam in sample_to_bams.items():
+            logger.info("  %s: %s", sa, bam)
+
+    elif config.fastq_dir:
         if not config.fastq_dir.exists() or not config.fastq_dir.is_dir():
             logger.error(
                 "指定された FASTQ ディレクトリが存在しないか、ディレクトリではありません: %s",
@@ -302,7 +415,7 @@ def main() -> None:
 
     # 7. 各サンプルの解析を実行
     parallel_samples: int = getattr(args, "parallel_samples", 1)
-    total_samples = len(sample_to_runs)
+    total_samples = len(sample_to_bams) if bam_mode else len(sample_to_runs)
 
     logger.info(
         "解析対象: %d サンプル (並列数: %d)",
@@ -314,20 +427,32 @@ def main() -> None:
     failed: List[Tuple[str, str]] = []
 
     if parallel_samples <= 1:
-        for sample_acc, runs in tqdm(
-            sample_to_runs.items(), desc="progress", unit="sample"
+        sample_items = sample_to_bams.items() if bam_mode else sample_to_runs.items()
+        for sample_acc, sample_input in tqdm(
+            sample_items, desc="progress", unit="sample"
         ):
-            acc, ok, step = process_sample(sample_acc, runs, config)
+            if bam_mode:
+                acc, ok, step = process_sample_from_dedup_bam(
+                    sample_acc, sample_input, config,
+                )
+            else:
+                acc, ok, step = process_sample(sample_acc, sample_input, config)
             if ok:
                 succeeded.append(acc)
             else:
                 failed.append((acc, step))
     else:
         with ThreadPoolExecutor(max_workers=parallel_samples) as executor:
-            future_to_acc = {
-                executor.submit(process_sample, acc, runs, config): acc
-                for acc, runs in sample_to_runs.items()
-            }
+            if bam_mode:
+                future_to_acc = {
+                    executor.submit(process_sample_from_dedup_bam, acc, bam, config): acc
+                    for acc, bam in sample_to_bams.items()
+                }
+            else:
+                future_to_acc = {
+                    executor.submit(process_sample, acc, runs, config): acc
+                    for acc, runs in sample_to_runs.items()
+                }
             with tqdm(total=total_samples, desc="progress", unit="sample") as pbar:
                 for future in as_completed(future_to_acc):
                     acc = future_to_acc[future]
