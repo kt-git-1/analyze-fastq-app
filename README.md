@@ -33,6 +33,7 @@
 ## このパイプラインでできること
 
 - ENA の project accession から FASTQ を取得する
+- `--download-only` で FASTQ のダウンロードだけを実行し、解析は後から開始できる
 - 手元の FASTQ ディレクトリを sample 単位に自動認識する
 - 複数レーンの FASTQ をサンプル単位に統合する
 - AdapterRemoval と BWA を用いて BAM を作成する
@@ -66,12 +67,17 @@ python main.py \
 ### ダウンロードと解析を分ける
 
 ```sh
-# Step 1: HTTPS でダウンロード
-python -m modules.ena_download_https --project PRJEB19970 --out ./data/raw_data --workers 2
+# Step 1: パイプラインのダウンロード専用モードで FASTQ だけ取得
+python main.py --project_accession PRJEB19970 --download-only --base_dir ./data
 
 # Step 2: ダウンロード済み FASTQ を解析
-python main.py --fastq_dir ./data/raw_data/PRJEB19970 --base_dir ./data
+python main.py \
+  --fastq_dir ./data/results/PRJEB19970/ena_fastq \
+  --base_dir ./data \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa
 ```
+
+`--download-only` は参照ゲノムや外部解析ツールの検証を行わず、FASTQ 取得が終わった時点で終了します。
 
 ### 並列実行
 

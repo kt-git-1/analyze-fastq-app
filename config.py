@@ -218,6 +218,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="ena_download_https でダウンロードしてから解析を実行（再開対応・HTTPS）",
     )
+    # ダウンロード専用モード
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help=(
+            "ENA から FASTQ をダウンロードするだけで終了します。"
+            "参照ゲノムや外部解析ツールは検証せず、解析も実行しません。"
+        ),
+    )
     return parser.parse_args()
 
 

@@ -3,7 +3,7 @@ import subprocess
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 from tqdm import tqdm
@@ -14,7 +14,7 @@ from config import (
     setup_logging,
     cleanup_intermediate_file,
 )
-from modules.fastq_parser import group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
+from modules.fastq_parser import group_fastqs_by_run
 from modules.ena_downloader import ENADownloader, verify_file_md5
 from modules.bwa_mapper import BWAMapper
 from modules.softclipper import SoftClipper
@@ -184,62 +184,48 @@ def process_sample(
     return sample_acc, True, ""
 
 
-# ============================================================
-# メインパイプライン
-# ============================================================
+def download_project_fastqs(config: PipelineConfig, session: requests.Session) -> Path:
+    """ENA からプロジェクトの FASTQ を取得し、保存先ルートを返す。"""
+    logger.info("ENA からデータをダウンロードします: project_accession=%s", config.project_accession)
+    ena_downloader = ENADownloader(config)
+    response_data = ena_downloader.get_api_response(config.project_accession, session)
+    sample_to_files = ena_downloader.parse_response_with_checksums(response_data)
 
-def main() -> None:
-    """NGS 解析パイプライン全体のエントリポイント。"""
+    downloaded_fastqs_root = config.results_dir / "ena_fastq"
+    downloaded_fastqs_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. 設定とロギングを初期化
-    args = parse_args()
-    config = PipelineConfig(args)
-    log_file = config.logs_dir / f"pipeline_{config.project_accession}.log"
-    setup_logging(log_file=log_file)
+    for sample_acc, url_md5_pairs in sample_to_files.items():
+        logger.info("ENA sample %s をダウンロード中...", sample_acc)
 
-    logger.info(
-        "解析パイプラインを開始します: project_accession=%s",
-        config.project_accession,
-    )
+        sample_dir = downloaded_fastqs_root / sample_acc
+        sample_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. （オプション）HTTPS でダウンロードしてから解析
-    if getattr(args, "download_via_https", False):
-        logger.info("ena_download_https でダウンロードを実行します")
-        out_dir = config.raw_data_dir.parent
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "modules.ena_download_https",
-                "--project",
-                config.project_accession,
-                "--out",
-                str(out_dir),
-                "--workers",
-                str(config.args.workers),
-            ],
-            check=True,
-        )
-        config.fastq_dir = config.raw_data_dir
-        logger.info("ダウンロード完了。解析を開始します")
+        ftp_urls = [u for u, _ in url_md5_pairs]
+        fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
 
-    # 3. リファレンスゲノムの存在を確認
-    if not config.reference_genome.exists():
-        logger.error("リファレンスゲノムが見つかりません: %s", config.reference_genome)
-        sys.exit(1)
+        if not fastq_files:
+            logger.warning("FASTQ がダウンロードできませんでした: %s", sample_acc)
+            continue
 
-    # 4. リファレンスゲノムのインデックスを作成
-    fai = config.reference_genome.with_suffix(".fai")
-    if not fai.exists():
-        logger.info("リファレンスゲノムのインデックスを作成します")
-        subprocess.run(["samtools", "faidx", str(config.reference_genome)], check=True)
+        url_to_md5 = {
+            Path(u.rstrip("/").split("/")[-1]): md5
+            for u, md5 in url_md5_pairs
+            if md5
+        }
+        for fastq in fastq_files:
+            dest = sample_dir / fastq.name
+            if fastq.resolve() != dest.resolve():
+                fastq.rename(dest)
+            expected_md5 = url_to_md5.get(Path(fastq.name))
+            if expected_md5 and not verify_file_md5(dest, expected_md5):
+                logger.warning("MD5 不一致のため削除します: %s", dest)
+                dest.unlink(missing_ok=True)
 
-    # 5. 外部ツール・ファイルの事前検証
-    config.validate_environment()
+    return downloaded_fastqs_root
 
-    session = requests.Session()
 
-    # 6. データソースを決定
+def collect_fastqs(config: PipelineConfig, session: requests.Session) -> Dict[str, List[Tuple[str, List[Path]]]]:
+    """設定に応じてローカルまたは ENA 由来の FASTQ を自動検出する。"""
     if config.fastq_dir:
         if not config.fastq_dir.exists() or not config.fastq_dir.is_dir():
             logger.error(
@@ -250,60 +236,28 @@ def main() -> None:
 
         logger.info("ローカルの FASTQ ファイルを使用します: %s", config.fastq_dir)
         sample_to_runs = group_fastqs_by_run(config.fastq_dir)
-
-        if not sample_to_runs:
-            logger.error("FASTQ ファイルが見つかりませんでした: %s", config.fastq_dir)
-            sys.exit(1)
-
-        for sa, runs in sample_to_runs.items():
-            logger.info("  %s: %d ラン検出", sa, len(runs))
-
+        source_dir = config.fastq_dir
     else:
-        logger.info("ENA からデータをダウンロードします")
-        ena_downloader = ENADownloader(config)
-        response_data = ena_downloader.get_api_response(
-            config.project_accession, session
-        )
-        sample_to_files = ena_downloader.parse_response_with_checksums(response_data)
+        source_dir = download_project_fastqs(config, session)
+        sample_to_runs = group_fastqs_by_run(source_dir)
 
-        downloaded_fastqs_root = config.results_dir / "ena_fastq"
-        downloaded_fastqs_root.mkdir(parents=True, exist_ok=True)
+    if not sample_to_runs:
+        logger.error("FASTQ ファイルが見つかりませんでした: %s", source_dir)
+        sys.exit(1)
 
-        for sample_acc, url_md5_pairs in sample_to_files.items():
-            logger.info("ENA sample %s をダウンロード中...", sample_acc)
+    for sample_acc, runs in sample_to_runs.items():
+        logger.info("  %s: %d ラン検出", sample_acc, len(runs))
 
-            sample_dir = downloaded_fastqs_root / sample_acc
-            sample_dir.mkdir(parents=True, exist_ok=True)
+    return sample_to_runs
 
-            ftp_urls = [u for u, _ in url_md5_pairs]
-            fastq_files = ena_downloader.download_sample_data(sample_acc, ftp_urls)
 
-            if not fastq_files:
-                logger.warning("FASTQ がダウンロードできませんでした: %s", sample_acc)
-                continue
-
-            url_to_md5 = {
-                Path(u.rstrip("/").split("/")[-1]): md5
-                for u, md5 in url_md5_pairs
-                if md5
-            }
-            for f in fastq_files:
-                dest = sample_dir / f.name
-                f.rename(dest)
-                expected_md5 = url_to_md5.get(Path(f.name))
-                if expected_md5 and not verify_file_md5(dest, expected_md5):
-                    logger.warning("MD5 不一致のため削除します: %s", dest)
-                    dest.unlink(missing_ok=True)
-
-        sample_to_runs = group_fastqs_by_run(downloaded_fastqs_root)
-        if not sample_to_runs:
-            logger.error("FASTQ ファイルが見つかりませんでした: %s", downloaded_fastqs_root)
-            sys.exit(1)
-
-    # 7. 各サンプルの解析を実行
-    parallel_samples: int = getattr(args, "parallel_samples", 1)
+def run_sample_analyses(
+    sample_to_runs: Dict[str, List[Tuple[str, List[Path]]]],
+    config: PipelineConfig,
+    parallel_samples: int,
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """サンプル単位の解析を逐次または並列に実行し、成功/失敗一覧を返す。"""
     total_samples = len(sample_to_runs)
-
     logger.info(
         "解析対象: %d サンプル (並列数: %d)",
         total_samples,
@@ -314,9 +268,7 @@ def main() -> None:
     failed: List[Tuple[str, str]] = []
 
     if parallel_samples <= 1:
-        for sample_acc, runs in tqdm(
-            sample_to_runs.items(), desc="progress", unit="sample"
-        ):
+        for sample_acc, runs in tqdm(sample_to_runs.items(), desc="progress", unit="sample"):
             acc, ok, step = process_sample(sample_acc, runs, config)
             if ok:
                 succeeded.append(acc)
@@ -342,7 +294,79 @@ def main() -> None:
                         failed.append((acc, step))
                     pbar.update(1)
 
-    # 8. サマリーを出力
+    return succeeded, failed
+
+
+# ============================================================
+# メインパイプライン
+# ============================================================
+
+def main() -> None:
+    """NGS 解析パイプライン全体のエントリポイント。"""
+
+    # 1. 設定とロギングを初期化
+    args = parse_args()
+    config = PipelineConfig(args)
+    log_file = config.logs_dir / f"pipeline_{config.project_accession}.log"
+    setup_logging(log_file=log_file)
+
+    logger.info(
+        "解析パイプラインを開始します: project_accession=%s",
+        config.project_accession,
+    )
+
+    session = requests.Session()
+
+    # 2. ダウンロード専用モードは外部解析ツール/参照ゲノムを要求しない
+    if getattr(args, "download_only", False):
+        download_project_fastqs(config, session)
+        logger.info("ダウンロード専用モードのため解析は実行しません")
+        return
+
+    # 3. （オプション）HTTPS でダウンロードしてから解析
+    if getattr(args, "download_via_https", False):
+        logger.info("ena_download_https でダウンロードを実行します")
+        out_dir = config.raw_data_dir.parent
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modules.ena_download_https",
+                "--project",
+                config.project_accession,
+                "--out",
+                str(out_dir),
+                "--workers",
+                str(config.args.workers),
+            ],
+            check=True,
+        )
+        config.fastq_dir = config.raw_data_dir
+        logger.info("ダウンロード完了。解析を開始します")
+
+    # 4. リファレンスゲノムの存在を確認
+    if not config.reference_genome.exists():
+        logger.error("リファレンスゲノムが見つかりません: %s", config.reference_genome)
+        sys.exit(1)
+
+    # 5. リファレンスゲノムのインデックスを作成
+    fai = config.reference_genome.with_suffix(".fai")
+    if not fai.exists():
+        logger.info("リファレンスゲノムのインデックスを作成します")
+        subprocess.run(["samtools", "faidx", str(config.reference_genome)], check=True)
+
+    # 6. 外部ツール・ファイルの事前検証
+    config.validate_environment()
+
+    # 7. データソースを決定し FASTQ を自動判定
+    sample_to_runs = collect_fastqs(config, session)
+
+    # 8. 各サンプルの解析を実行
+    parallel_samples: int = getattr(args, "parallel_samples", 1)
+    succeeded, failed = run_sample_analyses(sample_to_runs, config, parallel_samples)
+
+    # 9. サマリーを出力
+    total_samples = len(sample_to_runs)
     logger.info("=" * 60)
     logger.info(
         "パイプライン完了: 成功 %d / %d サンプル",
