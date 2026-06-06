@@ -14,7 +14,7 @@ from config import (
     setup_logging,
     cleanup_intermediate_file,
 )
-from modules.fastq_parser import group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
+from modules.fastq_parser import FastqRun, group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
 from modules.bam_parser import group_bams_by_sample
 from modules.ena_downloader import ENADownloader, verify_file_md5
 from modules.bwa_mapper import BWAMapper
@@ -51,7 +51,7 @@ def _ensure_bam_index(bam_path: Path) -> bool:
 
 def process_sample(
     sample_acc: str,
-    runs: List[Tuple[str, List[Path]]],
+    runs: List[FastqRun],
     config: PipelineConfig,
 ) -> Tuple[str, bool, str]:
     """
@@ -100,10 +100,17 @@ def process_sample(
     run_clean_bams: List[Path] = []
     failed_runs: List[str] = []
 
-    for run_idx, (run_id, fastq_files) in enumerate(runs, 1):
+    for run_idx, run in enumerate(runs, 1):
+        run_id = run.run_id
+        fastq_files = run.fastq_files
         # 1. BWA マッピング
         _log_progress(f"BWA mapping ({run_id}) [{run_idx}/{len(runs)}]")
-        bam_file = bwa_mapper.run_mapping_pipeline(sample_acc, run_id, fastq_files)
+        bam_file = bwa_mapper.run_mapping_pipeline(
+            sample_acc,
+            run_id,
+            fastq_files,
+            rg_library=run.rg_library,
+        )
         if not bam_file:
             logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
             failed_runs.append(run_id)

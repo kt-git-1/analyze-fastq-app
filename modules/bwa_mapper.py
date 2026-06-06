@@ -16,6 +16,7 @@ class BWAMapper:
         sample_acc: str,
         run_id: str,
         fastq_files: List[Path],
+        rg_library: Optional[str] = None,
     ) -> Optional[Path]:
         """
         1 ラン分の AdapterRemoval + BWA MEM を実行し、sorted BAM を返す。
@@ -29,11 +30,11 @@ class BWAMapper:
         bam_dir = run_dir / "bam_files"
         bam_dir.mkdir(parents=True, exist_ok=True)
 
-        rg_library = getattr(self.config.args, "rg_library", "unknown")
+        effective_rg_library = rg_library or getattr(self.config.args, "rg_library", "unknown")
         rg_center = getattr(self.config.args, "rg_center", "unknown")
         rg_string = (
             f"@RG\\tID:{run_id}\\tSM:{sample_acc}"
-            f"\\tLB:{rg_library}\\tCN:{rg_center}\\tPL:ILLUMINA"
+            f"\\tLB:{effective_rg_library}\\tCN:{rg_center}\\tPL:ILLUMINA"
         )
 
         # --- paired-end ---

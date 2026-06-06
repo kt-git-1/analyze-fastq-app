@@ -48,11 +48,17 @@ def test_run_mapping_pipeline_modern_pe_moves_outputs_and_maps(monkeypatch, make
     temp_prefix = cfg.temp_dir / "S1" / "RUN1"
     touch(temp_prefix.with_suffix(".pair1.truncated"))
     touch(temp_prefix.with_suffix(".pair2.truncated"))
-    monkeypatch.setattr(mapper, "_run_bwa_pe_and_sort", lambda r1, r2, out, rg, label: out)
+    captured = {}
+    monkeypatch.setattr(
+        mapper,
+        "_run_bwa_pe_and_sort",
+        lambda r1, r2, out, rg, label: captured.update(rg=rg) or out,
+    )
 
-    out = mapper.run_mapping_pipeline("S1", "RUN1", [Path("r1"), Path("r2")])
+    out = mapper.run_mapping_pipeline("S1", "RUN1", [Path("r1"), Path("r2")], rg_library="SCY1.1")
 
     assert out == cfg.results_dir / "S1" / "runs" / "RUN1" / "bam_files" / "RUN1.sorted.bam"
+    assert captured["rg"] == "@RG\\tID:RUN1\\tSM:S1\\tLB:SCY1.1\\tCN:center\\tPL:ILLUMINA"
 
 
 def test_ancient_pe_maps_available_outputs_and_merges(monkeypatch, make_config, tmp_path):

@@ -1,16 +1,19 @@
 from pathlib import Path
 
 import main as main_module
+from modules.fastq_parser import FastqRun
 from tests.conftest import touch
 
 
 class FakeBWAMapper:
     result = Path("mapped.bam")
+    calls = []
 
     def __init__(self, config):
         pass
 
-    def run_mapping_pipeline(self, sample_acc, run_id, fastq_files):
+    def run_mapping_pipeline(self, sample_acc, run_id, fastq_files, rg_library=None):
+        self.calls.append((sample_acc, run_id, fastq_files, rg_library))
         return self.result
 
 
@@ -27,6 +30,7 @@ class FakeSoftClipper:
 class FakeBAMProcessor:
     run_result = Path("clean.bam")
     dedup_result = Path("dedup.bam")
+    merge_calls = []
 
     def __init__(self, config):
         pass
@@ -35,6 +39,7 @@ class FakeBAMProcessor:
         return self.run_result
 
     def merge_and_dedup(self, sample_acc, run_clean_bams):
+        self.merge_calls.append((sample_acc, run_clean_bams))
         return self.dedup_result
 
 
@@ -80,9 +85,11 @@ def patch_pipeline_classes(monkeypatch):
 
 def reset_fake_results():
     FakeBWAMapper.result = Path("mapped.bam")
+    FakeBWAMapper.calls = []
     FakeSoftClipper.result = Path("soft.bam")
     FakeBAMProcessor.run_result = Path("clean.bam")
     FakeBAMProcessor.dedup_result = Path("dedup.bam")
+    FakeBAMProcessor.merge_calls = []
     FakeMapDamageAnalyzer.result = Path("mapdamage")
     FakeQualimapAnalyzer.result = Path("qualimap")
     FakeHaplotypeCaller.result = Path("sample.vcf")
@@ -93,7 +100,7 @@ def test_process_sample_skips_done_when_not_forced(make_config):
     (cfg.results_dir / "S1").mkdir(parents=True)
     (cfg.results_dir / "S1" / ".done").touch()
 
-    assert main_module.process_sample("S1", [("RUN1", [Path("r1")])], cfg) == ("S1", True, "")
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], cfg) == ("S1", True, "")
 
 
 def test_process_sample_success_creates_done(monkeypatch, make_config):
@@ -101,8 +108,26 @@ def test_process_sample_success_creates_done(monkeypatch, make_config):
     patch_pipeline_classes(monkeypatch)
     cfg = make_config()
 
-    assert main_module.process_sample("S1", [("RUN1", [Path("r1")])], cfg) == ("S1", True, "")
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], cfg) == ("S1", True, "")
     assert (cfg.results_dir / "S1" / ".done").exists()
+
+
+def test_process_sample_maps_all_fastq_runs_and_merges_outputs(monkeypatch, make_config):
+    reset_fake_results()
+    patch_pipeline_classes(monkeypatch)
+    cfg = make_config()
+    runs = [
+        FastqRun("S1", "RUN1", [Path("r1.fastq.gz")], "SCY1.1"),
+        FastqRun("S1", "RUN2", [Path("r2.fastq.gz")], "SCY1.2"),
+    ]
+
+    assert main_module.process_sample("S1", runs, cfg) == ("S1", True, "")
+
+    assert FakeBWAMapper.calls == [
+        ("S1", "RUN1", [Path("r1.fastq.gz")], "SCY1.1"),
+        ("S1", "RUN2", [Path("r2.fastq.gz")], "SCY1.2"),
+    ]
+    assert FakeBAMProcessor.merge_calls == [("S1", [Path("clean.bam"), Path("clean.bam")])]
 
 
 def test_process_sample_reports_mapping_failure(monkeypatch, make_config):
@@ -110,7 +135,7 @@ def test_process_sample_reports_mapping_failure(monkeypatch, make_config):
     patch_pipeline_classes(monkeypatch)
     FakeBWAMapper.result = None
 
-    assert main_module.process_sample("S1", [("RUN1", [Path("r1")])], make_config()) == (
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], make_config()) == (
         "S1",
         False,
         "all runs failed",
@@ -122,7 +147,7 @@ def test_process_sample_reports_downstream_failure(monkeypatch, make_config):
     patch_pipeline_classes(monkeypatch)
     FakeQualimapAnalyzer.result = None
 
-    assert main_module.process_sample("S1", [("RUN1", [Path("r1")])], make_config()) == (
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], make_config()) == (
         "S1",
         False,
         "Qualimap",
