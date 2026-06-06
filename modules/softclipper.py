@@ -77,7 +77,7 @@ class SoftClipper:
         except Exception:
             return None
 
-    def run_softclipping(self, sample_acc, run_id, bam_file):
+    def run_softclipping(self, sample_acc, run_id, bam_file, progress_enabled=True):
         """Apply softclipping to BAM file"""
         logger.info("softclipping を実行します: %s / %s", sample_acc, run_id)
 
@@ -99,7 +99,7 @@ class SoftClipper:
                     unit_scale=True,
                     dynamic_ncols=True,
                     leave=False,
-                    disable=getattr(self.config.args, "no_progress", False),
+                    disable=(not progress_enabled) or getattr(self.config.args, "no_progress", False),
                 )
 
                 while True:

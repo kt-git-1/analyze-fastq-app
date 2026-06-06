@@ -3,7 +3,13 @@ import hashlib
 import pytest
 
 import modules.ena_download_https as https_module
-from modules.ena_download_https import download_display_name, download_via_https, shorten_middle, to_https_url
+from modules.ena_download_https import (
+    DownloadDashboard,
+    download_display_name,
+    download_via_https,
+    shorten_middle,
+    to_https_url,
+)
 
 
 class FakeResponse:
@@ -62,6 +68,52 @@ def test_download_display_name_limits_long_fastq_names():
     assert display.startswith("SAMEA103910511 / ")
     assert "..." in display
     assert len(display) <= 45
+
+
+def test_download_dashboard_renders_human_readable_status(monkeypatch):
+    monkeypatch.setattr(https_module.time, "monotonic", lambda: 100.0)
+    dashboard = DownloadDashboard("PRJEB19970", total_samples=14, total_files=216, parallel=4, enabled=False)
+    dashboard.file_started_at = 90.0
+    dashboard.start_file(
+        153,
+        "SAMEA103910511",
+        7,
+        12,
+        "BER01_A__BER01_A_E16.1_user_TGTCTG_PC4T_20140922_hiseq3a.fastq.gz",
+    )
+    dashboard.update_file(420 * 1024 * 1024, 588 * 1024 * 1024)
+    dashboard.finish_file(md5_checked=True)
+
+    text = dashboard.render_text()
+
+    assert "ENA download: PRJEB19970" in text
+    assert "全体進捗" in text
+    assert "153/216 files" in text
+    assert "サンプル  SAMEA103910511" in text
+    assert "8/12 files" in text
+    assert "現在" in text
+    assert "サイズ" in text
+    assert "速度" in text
+    assert "残り時間" in text
+    assert "最近のイベント" in text
+    assert "MD5確認OK" in text
+    assert "root:" not in text
+    assert "__main__:" not in text
+
+
+def test_download_via_https_reports_progress(monkeypatch, tmp_path):
+    dest = tmp_path / "file.fastq.gz"
+    session = FakeSession(FakeResponse([b"ab", b"cd"], status_code=206))
+    calls = []
+
+    assert download_via_https(
+        session,
+        "https://example/file.fastq.gz",
+        dest,
+        progress_callback=lambda done, total: calls.append((done, total)),
+    ) == dest
+
+    assert calls == [(0, 4), (2, 4), (4, 4)]
 
 
 def test_download_via_https_skips_when_existing_md5_matches(monkeypatch, tmp_path):

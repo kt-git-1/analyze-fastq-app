@@ -1,13 +1,15 @@
 import sys
 import subprocess
 import logging
+import shutil
+import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from tqdm import tqdm
 
 from config import (
     PipelineConfig,
@@ -63,6 +65,191 @@ def _log_failure_hint(sample_acc: str, step_name: str) -> None:
     )
 
 
+def _shorten_middle(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return "." * width
+    left = (width - 3) // 2
+    right = width - 3 - left
+    return text[:left] + "..." + text[-right:]
+
+
+def _progress_bar(done: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = int(width * min(done, total) / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "約 %d時間%d分" % (hours, minutes)
+    if minutes:
+        return "約 %d分%d秒" % (minutes, sec)
+    return "約 %d秒" % sec
+
+
+def _set_stream_log_level(level: int) -> None:
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            handler.setLevel(level)
+
+
+class AnalysisDashboard:
+    """解析パイプライン用の固定表示ダッシュボード。"""
+
+    def __init__(
+        self,
+        project: str,
+        input_mode: str,
+        total_samples: int,
+        parallel_samples: int,
+        threads_per_sample: int,
+        enabled: bool = True,
+    ) -> None:
+        self.project = project
+        self.input_mode = input_mode
+        self.total_samples = total_samples
+        self.parallel_samples = parallel_samples
+        self.threads_per_sample = threads_per_sample
+        self.enabled = enabled
+        self.completed_samples = 0
+        self.succeeded_samples = 0
+        self.failed_samples = 0
+        self.sample_acc = "-"
+        self.current_step = "-"
+        self.current_step_index = 0
+        self.total_steps = 0
+        self.input_summary = "-"
+        self.started_at = time.monotonic()
+        self.events: List[str] = []
+        self._rendered_lines = 0
+        self._last_rendered_at = 0.0
+        self._lock = threading.Lock()
+
+    def add_event(self, message: str) -> None:
+        with self._lock:
+            self._add_event_unlocked(message)
+            self._render_unlocked(force=True)
+
+    def _add_event_unlocked(self, message: str) -> None:
+        self.events.append("%s  %s" % (time.strftime("%H:%M:%S"), message))
+        self.events = self.events[-3:]
+
+    def start_sample(self, sample_acc: str, total_steps: int, input_summary: str) -> None:
+        with self._lock:
+            self.sample_acc = sample_acc
+            self.current_step = "-"
+            self.current_step_index = 0
+            self.total_steps = total_steps
+            self.input_summary = input_summary
+            self._add_event_unlocked("解析開始: %s" % sample_acc)
+            self._render_unlocked(force=True)
+
+    def start_step(self, sample_acc: str, step_name: str, step_index: int, total_steps: int) -> None:
+        with self._lock:
+            if self.sample_acc == sample_acc and self.current_step not in ("-", step_name):
+                self._add_event_unlocked("完了: %s" % self.current_step)
+            self.sample_acc = sample_acc
+            self.current_step = step_name
+            self.current_step_index = step_index
+            self.total_steps = total_steps
+            self._add_event_unlocked("開始: %s" % step_name)
+            self._render_unlocked(force=True)
+
+    def skip_steps(self, sample_acc: str, step_index: int, total_steps: int) -> None:
+        with self._lock:
+            self.sample_acc = sample_acc
+            self.current_step_index = step_index
+            self.total_steps = total_steps
+            self._render_unlocked(force=True)
+
+    def finish_sample(self, sample_acc: str, ok: bool, failed_step: str = "") -> None:
+        with self._lock:
+            if ok and self.sample_acc == sample_acc and self.current_step != "-":
+                self._add_event_unlocked("完了: %s" % self.current_step)
+            self.completed_samples += 1
+            if ok:
+                self.succeeded_samples += 1
+                self._add_event_unlocked("解析完了: %s" % sample_acc)
+            else:
+                self.failed_samples += 1
+                self._add_event_unlocked("解析失敗: %s / %s" % (sample_acc, failed_step))
+            self._render_unlocked(force=True)
+
+    def render_text(self) -> str:
+        with self._lock:
+            return self._render_text_unlocked()
+
+    def _render_text_unlocked(self) -> str:
+        overall_percent = int(round(self.completed_samples / self.total_samples * 100)) if self.total_samples else 100
+        step_percent = int(round(self.current_step_index / self.total_steps * 100)) if self.total_steps else 0
+        terminal_width = shutil.get_terminal_size((100, 20)).columns
+        sample_width = max(18, min(36, terminal_width - 32))
+        step_width = max(24, min(54, terminal_width - 12))
+        event_lines = self.events or ["-"]
+
+        return "\n".join(
+            [
+                "解析パイプライン: %s" % self.project,
+                "",
+                "全体進捗  %s  %3d%%  %d/%d samples" % (
+                    _progress_bar(self.completed_samples, self.total_samples),
+                    overall_percent,
+                    self.completed_samples,
+                    self.total_samples,
+                ),
+                "サンプル  %s" % _shorten_middle(self.sample_acc, sample_width),
+                "現在      %s" % _shorten_middle(self.current_step, step_width),
+                "ステップ  %s  %3d%%  %d/%d" % (
+                    _progress_bar(self.current_step_index, self.total_steps),
+                    step_percent,
+                    self.current_step_index,
+                    self.total_steps,
+                ),
+                "入力      %s" % self.input_summary,
+                "並列数    %d samples" % self.parallel_samples,
+                "スレッド  %d / sample" % self.threads_per_sample,
+                "経過時間  %s" % _format_duration(time.monotonic() - self.started_at),
+                "成功/失敗 %d / %d" % (self.succeeded_samples, self.failed_samples),
+                "",
+                "最近のイベント",
+            ]
+            + ["  %s" % line for line in event_lines]
+        )
+
+    def render(self, force: bool = False) -> None:
+        with self._lock:
+            self._render_unlocked(force=force)
+
+    def _render_unlocked(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_rendered_at < 0.2:
+            return
+        text = self._render_text_unlocked()
+        if self._rendered_lines:
+            sys.stderr.write("\033[%dF\033[J" % self._rendered_lines)
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+        self._rendered_lines = text.count("\n") + 1
+        self._last_rendered_at = now
+
+    def close(self) -> None:
+        self.render(force=True)
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
 def _ensure_bam_index(bam_path: Path) -> bool:
     """Create a BAM index next to the BAM if it does not already exist."""
     bai_path = Path(str(bam_path) + ".bai")
@@ -89,6 +276,7 @@ def process_sample(
     runs: List[FastqRun],
     config: PipelineConfig,
     progress_position: Optional[int] = None,
+    dashboard: Optional[AnalysisDashboard] = None,
 ) -> Tuple[str, bool, str]:
     """
     1 サンプル分の解析パイプラインを実行する。
@@ -118,23 +306,15 @@ def process_sample(
     # ステップ数: ラン単位 3 ステップ × N ラン + サンプル単位 4 ステップ
     total_steps = 3 * len(runs) + 4
     current_step = 0
-    sample_pbar = tqdm(
-        total=total_steps,
-        desc=sample_acc,
-        unit="step",
-        position=progress_position,
-        leave=False,
-        dynamic_ncols=True,
-        disable=not _progress_enabled(config),
-    )
+    if dashboard is not None:
+        dashboard.start_sample(sample_acc, total_steps, "FASTQ  %d runs" % len(runs))
 
     def _log_progress(step_name: str) -> None:
         nonlocal current_step
         current_step += 1
         pct = int(current_step / total_steps * 100)
-        sample_pbar.set_description_str(f"{sample_acc} {step_name}")
-        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
-        sample_pbar.update(1)
+        if dashboard is not None:
+            dashboard.start_step(sample_acc, step_name, current_step, total_steps)
         logger.info(
             "[%s] %d%% (%d/%d) %s",
             sample_acc, pct, current_step, total_steps, step_name,
@@ -143,8 +323,8 @@ def process_sample(
     def _skip_progress(steps: int) -> None:
         nonlocal current_step
         current_step += steps
-        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
-        sample_pbar.update(steps)
+        if dashboard is not None:
+            dashboard.skip_steps(sample_acc, current_step, total_steps)
 
     logger.info("サンプルの解析を開始します: %s (%d ラン, %d ステップ)", sample_acc, len(runs), total_steps)
 
@@ -174,7 +354,12 @@ def process_sample(
 
         # 2. Soft clipping
         _log_progress(f"Soft clipping ({run_id})")
-        softclipped_bam = softclipper.run_softclipping(sample_acc, run_id, bam_file)
+        softclipped_bam = softclipper.run_softclipping(
+            sample_acc,
+            run_id,
+            bam_file,
+            progress_enabled=dashboard is None,
+        )
         if not softclipped_bam:
             logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
             _log_failure_hint(sample_acc, "Soft clipping")
@@ -212,7 +397,6 @@ def process_sample(
     if not run_clean_bams:
         logger.error("有効なランがありません: %s", sample_acc)
         _log_failure_hint(sample_acc, "all runs failed")
-        sample_pbar.close()
         return sample_acc, False, "all runs failed"
 
     # ------------------------------------------------------------------
@@ -226,12 +410,10 @@ def process_sample(
     except Exception:
         logger.exception("merge/dedup に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "merge/dedup")
-        sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
     if not dedup_bam:
         _log_failure_hint(sample_acc, "merge/dedup")
-        sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
     for bam in run_clean_bams:
@@ -243,7 +425,6 @@ def process_sample(
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "mapDamage")
-        sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
     # 6. Qualimap
@@ -252,7 +433,6 @@ def process_sample(
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "Qualimap")
-        sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
@@ -261,7 +441,6 @@ def process_sample(
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "HaplotypeCaller")
-        sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
     # 8. 最終クリーンアップ
@@ -274,7 +453,6 @@ def process_sample(
     done_flag.touch()
 
     logger.info("サンプルの解析を完了しました: %s", sample_acc)
-    sample_pbar.close()
     return sample_acc, True, ""
 
 
@@ -283,6 +461,7 @@ def process_sample_from_dedup_bam(
     dedup_bam: Path,
     config: PipelineConfig,
     progress_position: Optional[int] = None,
+    dashboard: Optional[AnalysisDashboard] = None,
 ) -> Tuple[str, bool, str]:
     """
     既存 dedup BAM から QC と VCF 出力のみを実行する。
@@ -315,23 +494,15 @@ def process_sample_from_dedup_bam(
 
     total_steps = 3
     current_step = 0
-    sample_pbar = tqdm(
-        total=total_steps,
-        desc=sample_acc,
-        unit="step",
-        position=progress_position,
-        leave=False,
-        dynamic_ncols=True,
-        disable=not _progress_enabled(config),
-    )
+    if dashboard is not None:
+        dashboard.start_sample(sample_acc, total_steps, "BAM  既存dedup BAM")
 
     def _log_progress(step_name: str) -> None:
         nonlocal current_step
         current_step += 1
         pct = int(current_step / total_steps * 100)
-        sample_pbar.set_description_str(f"{sample_acc} {step_name}")
-        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
-        sample_pbar.update(1)
+        if dashboard is not None:
+            dashboard.start_step(sample_acc, step_name, current_step, total_steps)
         logger.info(
             "[%s] %d%% (%d/%d) %s",
             sample_acc, pct, current_step, total_steps, step_name,
@@ -344,7 +515,6 @@ def process_sample_from_dedup_bam(
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "mapDamage")
-        sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
     _log_progress("Qualimap")
@@ -352,7 +522,6 @@ def process_sample_from_dedup_bam(
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "Qualimap")
-        sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
     _log_progress("HaplotypeCaller")
@@ -360,14 +529,12 @@ def process_sample_from_dedup_bam(
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "HaplotypeCaller")
-        sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
     done_flag.parent.mkdir(parents=True, exist_ok=True)
     done_flag.touch()
 
     logger.info("既存 dedup BAM からの解析を完了しました: %s", sample_acc)
-    sample_pbar.close()
     return sample_acc, True, ""
 
 
@@ -522,64 +689,53 @@ def main() -> None:
         total_samples,
         parallel_samples,
     )
-    if progress_enabled:
-        logger.info(
-            "解析パイプライン: %s | 入力モード: %s | 対象サンプル: %d | 並列数: %d | スレッド/サンプル: %d",
-            config.project_accession,
-            "BAM" if bam_mode else "FASTQ",
-            total_samples,
-            parallel_samples,
-            config.args.threads,
-        )
 
     succeeded: List[str] = []
     failed: List[Tuple[str, str]] = []
+    dashboard = AnalysisDashboard(
+        config.project_accession,
+        "BAM" if bam_mode else "FASTQ",
+        total_samples,
+        parallel_samples,
+        config.args.threads,
+        enabled=progress_enabled,
+    )
+    if progress_enabled:
+        _set_stream_log_level(logging.WARNING)
+    dashboard.render(force=True)
 
-    if parallel_samples <= 1:
-        sample_items = list(sample_to_bams.items() if bam_mode else sample_to_runs.items())
-        for sample_acc, sample_input in tqdm(
-            sample_items,
-            desc="全体進捗",
-            unit="sample",
-            position=0,
-            dynamic_ncols=True,
-            disable=not progress_enabled,
-        ):
-            if bam_mode:
-                acc, ok, step = process_sample_from_dedup_bam(
-                    sample_acc, sample_input, config, progress_position=1,
-                )
-            else:
-                acc, ok, step = process_sample(
-                    sample_acc, sample_input, config, progress_position=1,
-                )
-            if ok:
-                succeeded.append(acc)
-            else:
-                failed.append((acc, step))
-    else:
-        with ThreadPoolExecutor(max_workers=parallel_samples) as executor:
+    try:
+        if parallel_samples <= 1:
             sample_items = list(sample_to_bams.items() if bam_mode else sample_to_runs.items())
-            if bam_mode:
-                future_to_acc = {
-                    executor.submit(
-                        process_sample_from_dedup_bam, acc, bam, config, idx + 1,
-                    ): acc
-                    for idx, (acc, bam) in enumerate(sample_items)
-                }
-            else:
-                future_to_acc = {
-                    executor.submit(process_sample, acc, runs, config, idx + 1): acc
-                    for idx, (acc, runs) in enumerate(sample_items)
-                }
-            with tqdm(
-                total=total_samples,
-                desc="全体進捗",
-                unit="sample",
-                position=0,
-                dynamic_ncols=True,
-                disable=not progress_enabled,
-            ) as pbar:
+            for sample_acc, sample_input in sample_items:
+                if bam_mode:
+                    acc, ok, step = process_sample_from_dedup_bam(
+                        sample_acc, sample_input, config, dashboard=dashboard,
+                    )
+                else:
+                    acc, ok, step = process_sample(
+                        sample_acc, sample_input, config, dashboard=dashboard,
+                    )
+                dashboard.finish_sample(acc, ok, step)
+                if ok:
+                    succeeded.append(acc)
+                else:
+                    failed.append((acc, step))
+        else:
+            with ThreadPoolExecutor(max_workers=parallel_samples) as executor:
+                sample_items = list(sample_to_bams.items() if bam_mode else sample_to_runs.items())
+                if bam_mode:
+                    future_to_acc = {
+                        executor.submit(
+                            process_sample_from_dedup_bam, acc, bam, config, idx + 1, dashboard,
+                        ): acc
+                        for idx, (acc, bam) in enumerate(sample_items)
+                    }
+                else:
+                    future_to_acc = {
+                        executor.submit(process_sample, acc, runs, config, idx + 1, dashboard): acc
+                        for idx, (acc, runs) in enumerate(sample_items)
+                    }
                 for future in as_completed(future_to_acc):
                     acc = future_to_acc[future]
                     try:
@@ -592,7 +748,11 @@ def main() -> None:
                         succeeded.append(acc)
                     else:
                         failed.append((acc, step))
-                    pbar.update(1)
+                    dashboard.finish_sample(acc, ok, step)
+    finally:
+        dashboard.close()
+        if progress_enabled:
+            _set_stream_log_level(logging.INFO)
 
     # 8. サマリーを出力
     logger.info("=" * 60)

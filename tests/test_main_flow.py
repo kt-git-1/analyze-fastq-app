@@ -23,7 +23,7 @@ class FakeSoftClipper:
     def __init__(self, config):
         pass
 
-    def run_softclipping(self, sample_acc, run_id, bam_file):
+    def run_softclipping(self, sample_acc, run_id, bam_file, progress_enabled=True):
         return self.result
 
 
@@ -180,3 +180,36 @@ def test_process_sample_from_dedup_bam_reports_missing_empty_and_index_failure(m
     bam = touch(tmp_path / "S1.bam")
     monkeypatch.setattr(main_module, "_ensure_bam_index", lambda path: False)
     assert main_module.process_sample_from_dedup_bam("S1", bam, cfg) == ("S1", False, "samtools index")
+
+
+def test_analysis_dashboard_renders_human_readable_status(monkeypatch):
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: 100.0)
+    dashboard = main_module.AnalysisDashboard(
+        "PRJEB19970",
+        "FASTQ",
+        total_samples=14,
+        parallel_samples=4,
+        threads_per_sample=8,
+        enabled=False,
+    )
+    dashboard.started_at = 80.0
+    dashboard.start_sample("SAMEA103910511", 10, "FASTQ  2 runs")
+    dashboard.start_step("SAMEA103910511", "BWA mapping (RUN1) [1/2]", 1, 10)
+    dashboard.finish_sample("SAMEA103910511", True, "")
+
+    text = dashboard.render_text()
+
+    assert "解析パイプライン: PRJEB19970" in text
+    assert "全体進捗" in text
+    assert "1/14 samples" in text
+    assert "サンプル  SAMEA103910511" in text
+    assert "現在      BWA mapping (RUN1) [1/2]" in text
+    assert "ステップ" in text
+    assert "1/10" in text
+    assert "入力      FASTQ  2 runs" in text
+    assert "並列数    4 samples" in text
+    assert "スレッド  8 / sample" in text
+    assert "最近のイベント" in text
+    assert "解析完了" in text
+    assert "root:" not in text
+    assert "__main__:" not in text
