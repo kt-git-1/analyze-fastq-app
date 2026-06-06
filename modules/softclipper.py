@@ -120,5 +120,10 @@ class SoftClipper:
             logger.info("softclipping が完了しました: %s / %s", sample_acc, run_id)
             return output_bam
         except Exception as e:
-            logger.error("softclipping に失敗しました: %s / %s: %s", sample_acc, run_id, e)
+            logger.error(
+                "softclipping に失敗しました: %s / %s。確認: 入力BAM、CIGAR情報、pysamで読み込めるBAM形式を確認してください。詳細: %s",
+                sample_acc,
+                run_id,
+                e,
+            )
             return None 

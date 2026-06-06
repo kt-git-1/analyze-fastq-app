@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from modules.logging_utils import log_command_start, log_tool_output
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,14 +137,14 @@ class BAMProcessor:
 
     def _run_cmd(self, cmd: list, step_name: str) -> None:
         """コマンドを実行し stderr をリアルタイムでログに出力する。"""
-        logger.info("Running: %s", " ".join(str(c) for c in cmd))
+        log_command_start(logger, cmd, step_name)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         for line in iter(proc.stderr.readline, ""):
             line = line.rstrip()
             if line:
-                logger.info("[%s] %s", step_name, line)
+                log_tool_output(logger, step_name, line)
         proc.stderr.close()
         proc.wait()
         if proc.returncode != 0:

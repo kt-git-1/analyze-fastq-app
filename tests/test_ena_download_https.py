@@ -3,7 +3,7 @@ import hashlib
 import pytest
 
 import modules.ena_download_https as https_module
-from modules.ena_download_https import download_via_https, to_https_url
+from modules.ena_download_https import download_display_name, download_via_https, shorten_middle, to_https_url
 
 
 class FakeResponse:
@@ -46,6 +46,22 @@ class FakeSession:
 )
 def test_to_https_url(url, expected):
     assert to_https_url(url) == expected
+
+
+def test_shorten_middle_keeps_short_text_and_truncates_long_text():
+    assert shorten_middle("short.fastq.gz", 20) == "short.fastq.gz"
+    assert shorten_middle("abcdefghijklmnopqrstuvwxyz", 12) == "abcd...vwxyz"
+    assert shorten_middle("abcdef", 3) == "..."
+
+
+def test_download_display_name_limits_long_fastq_names():
+    filename = "BER01_A__BER01_A_E16.1_user_TGTCTG__BER01_A_E16.1_user_TGTCTG_PC4T_20140922_hiseq3a.fastq.gz"
+
+    display = download_display_name("SAMEA103910511", filename, terminal_width=90)
+
+    assert display.startswith("SAMEA103910511 / ")
+    assert "..." in display
+    assert len(display) <= 45
 
 
 def test_download_via_https_skips_when_existing_md5_matches(monkeypatch, tmp_path):

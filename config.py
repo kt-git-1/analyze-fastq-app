@@ -275,7 +275,7 @@ def setup_logging(log_file: Path, use_tqdm: bool = False) -> logging.Logger:
     パイプライン全体で使うロガーを初期化します。
     """
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -289,7 +289,13 @@ def setup_logging(log_file: Path, use_tqdm: bool = False) -> logging.Logger:
     if not has_stream_handler:
         stream_handler = TqdmLoggingHandler() if use_tqdm else logging.StreamHandler()
         stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(logging.INFO)
         logger.addHandler(stream_handler)
+    else:
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setFormatter(formatter)
+                handler.setLevel(logging.INFO)
 
     log_file = Path(log_file)
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +307,13 @@ def setup_logging(log_file: Path, use_tqdm: bool = False) -> logging.Logger:
     if not file_exists:
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
         logger.addHandler(file_handler)
+    else:
+        for handler in logger.handlers:
+            if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_file:
+                handler.setFormatter(formatter)
+                handler.setLevel(logging.DEBUG)
 
     return logger
 

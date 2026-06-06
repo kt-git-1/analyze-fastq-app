@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+from modules.logging_utils import format_command, log_command_start, log_tool_output
+
 logger = logging.getLogger(__name__)
 
 class BWAMapper:
@@ -177,14 +179,14 @@ class BWAMapper:
 
     def _run_streaming(self, cmd: list, step_name: str) -> None:
         """コマンドを実行し stderr をリアルタイムでログに出力する。"""
-        logger.info("Running: %s", " ".join(str(c) for c in cmd))
+        log_command_start(logger, cmd, step_name)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         for line in iter(proc.stderr.readline, ""):
             line = line.rstrip()
             if line:
-                logger.info("[%s] %s", step_name, line)
+                log_tool_output(logger, step_name, line)
         proc.stderr.close()
         proc.wait()
         if proc.returncode != 0:
@@ -268,6 +270,10 @@ class BWAMapper:
         view_cmd = ["samtools", "view", "-b", "-"]
         sort_cmd = ["samtools", "sort", "-o", str(bam_out), "-"]
         try:
+            logger.info("外部ツールを実行します: BWA %s", label)
+            logger.debug("実行コマンド (BWA %s): %s", label, format_command(bwa_cmd))
+            logger.debug("実行コマンド (samtools view %s): %s", label, format_command(view_cmd))
+            logger.debug("実行コマンド (samtools sort %s): %s", label, format_command(sort_cmd))
             bwa_proc = subprocess.Popen(
                 bwa_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
@@ -276,7 +282,7 @@ class BWAMapper:
                 for raw in bwa_proc.stderr:
                     line = raw.decode("utf-8", errors="replace").rstrip()
                     if line:
-                        logger.info("[BWA %s] %s", label, line)
+                        log_tool_output(logger, "BWA %s" % label, line)
                 bwa_proc.stderr.close()
 
             stderr_thread = threading.Thread(target=_drain_bwa_stderr, daemon=True)
@@ -321,6 +327,7 @@ class BWAMapper:
 
         merge_cmd = ["samtools", "merge", "-f", str(merged_bam), *bam_paths]
         try:
+            log_command_start(logger, merge_cmd, "samtools merge")
             subprocess.run(merge_cmd, check=True)
             logger.info("BAM マージ完了: %s", merged_bam.name)
             return True

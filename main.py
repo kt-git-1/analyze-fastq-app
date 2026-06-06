@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import logging
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,8 +30,37 @@ from modules.analyzers import (
 logger = logging.getLogger(__name__)
 
 
+FAILURE_HINTS = {
+    "BWA mapping": "FASTQファイル、参照ゲノムのBWA index、bwa/samtoolsのインストールを確認してください。",
+    "Soft clipping": "入力BAM、pysamで読み込めるBAM形式、CIGAR情報を確認してください。",
+    "CleanSam": "Picard jar、Javaメモリ設定、入力BAMの整合性を確認してください。",
+    "merge/dedup": "ランごとのBAM、samtools、Picard MarkDuplicates、Javaメモリ設定を確認してください。",
+    "mapDamage": "mapDamage、参照ゲノム、BAM index、フィルタ後BAMを確認してください。",
+    "Qualimap": "Qualimap、Java設定、BAM index、マッピング済みリード数を確認してください。",
+    "HaplotypeCaller": "GATK、reference.fa/.fai/.dict、BAM index、スレッド数を確認してください。",
+    "samtools index": "samtools、入力BAMの破損、BAMを書き込んだディレクトリの権限を確認してください。",
+    "BAM missing": "指定したBAMディレクトリ、ファイル名パターン、サンプル名の抽出設定を確認してください。",
+    "BAM empty": "入力BAMの作成元、前段のマッピング結果、ファイル転送の途中失敗を確認してください。",
+    "all runs failed": "各ランのFASTQ、AdapterRemoval、BWA mapping、Soft clipping、CleanSamのログを確認してください。",
+    "unexpected exception": "直前の例外ログと対象サンプルの入力ファイルを確認してください。",
+}
+
+
 def _progress_enabled(config: PipelineConfig) -> bool:
     return not getattr(config.args, "no_progress", False)
+
+
+def _failure_hint(step_name: str) -> str:
+    return FAILURE_HINTS.get(step_name, "直前の詳細ログと入力ファイルを確認してください。")
+
+
+def _log_failure_hint(sample_acc: str, step_name: str) -> None:
+    logger.error(
+        "確認ポイント: サンプル %s / 失敗ステップ %s。%s",
+        sample_acc,
+        step_name,
+        _failure_hint(step_name),
+    )
 
 
 def _ensure_bam_index(bam_path: Path) -> bool:
@@ -46,6 +76,7 @@ def _ensure_bam_index(bam_path: Path) -> bool:
         return True
     except subprocess.CalledProcessError:
         logger.exception("BAM index の作成に失敗しました: %s", bam_path)
+        logger.error("確認ポイント: %s", _failure_hint("samtools index"))
         return False
 
 
@@ -136,6 +167,7 @@ def process_sample(
         )
         if not bam_file:
             logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
+            _log_failure_hint(sample_acc, "BWA mapping")
             failed_runs.append(run_id)
             _skip_progress(2)
             continue
@@ -145,6 +177,7 @@ def process_sample(
         softclipped_bam = softclipper.run_softclipping(sample_acc, run_id, bam_file)
         if not softclipped_bam:
             logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
+            _log_failure_hint(sample_acc, "Soft clipping")
             failed_runs.append(run_id)
             _skip_progress(1)
             continue
@@ -157,6 +190,7 @@ def process_sample(
             clean_bam = bam_processor.process_run_bam(sample_acc, run_id, softclipped_bam)
         except Exception:
             logger.exception("CleanSam 失敗 → ラン %s をスキップ", run_id)
+            _log_failure_hint(sample_acc, "CleanSam")
             failed_runs.append(run_id)
             continue
 
@@ -177,6 +211,7 @@ def process_sample(
 
     if not run_clean_bams:
         logger.error("有効なランがありません: %s", sample_acc)
+        _log_failure_hint(sample_acc, "all runs failed")
         sample_pbar.close()
         return sample_acc, False, "all runs failed"
 
@@ -190,10 +225,12 @@ def process_sample(
         dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
     except Exception:
         logger.exception("merge/dedup に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "merge/dedup")
         sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
     if not dedup_bam:
+        _log_failure_hint(sample_acc, "merge/dedup")
         sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
@@ -205,6 +242,7 @@ def process_sample(
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "mapDamage")
         sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
@@ -213,6 +251,7 @@ def process_sample(
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "Qualimap")
         sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
@@ -221,6 +260,7 @@ def process_sample(
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "HaplotypeCaller")
         sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
@@ -258,10 +298,12 @@ def process_sample_from_dedup_bam(
 
     if not dedup_bam.exists() or not dedup_bam.is_file():
         logger.error("BAM ファイルが見つかりません: %s", dedup_bam)
+        _log_failure_hint(sample_acc, "BAM missing")
         return sample_acc, False, "BAM missing"
 
     if dedup_bam.stat().st_size == 0:
         logger.error("BAM ファイルが空です: %s", dedup_bam)
+        _log_failure_hint(sample_acc, "BAM empty")
         return sample_acc, False, "BAM empty"
 
     if not _ensure_bam_index(dedup_bam):
@@ -301,6 +343,7 @@ def process_sample_from_dedup_bam(
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "mapDamage")
         sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
@@ -308,6 +351,7 @@ def process_sample_from_dedup_bam(
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "Qualimap")
         sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
@@ -315,6 +359,7 @@ def process_sample_from_dedup_bam(
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+        _log_failure_hint(sample_acc, "HaplotypeCaller")
         sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
@@ -541,6 +586,7 @@ def main() -> None:
                         _, ok, step = future.result()
                     except Exception:
                         logger.exception("サンプル %s で予期しない例外が発生しました", acc)
+                        _log_failure_hint(acc, "unexpected exception")
                         ok, step = False, "unexpected exception"
                     if ok:
                         succeeded.append(acc)
@@ -559,6 +605,12 @@ def main() -> None:
         logger.warning("失敗サンプル一覧:")
         for acc, step in failed:
             logger.warning("  %s  (失敗ステップ: %s)", acc, step)
+        logger.warning("失敗ステップ別:")
+        for step, count in Counter(step for _, step in failed).most_common():
+            logger.warning("  %s: %d サンプル", step, count)
+            logger.warning("    確認: %s", _failure_hint(step))
+    logger.info("出力先: %s", config.results_dir)
+    logger.info("ログファイル: %s", log_file)
     logger.info("=" * 60)
 
 

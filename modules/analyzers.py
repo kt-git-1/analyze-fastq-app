@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Optional, List
 
+from modules.logging_utils import log_command_start, log_tool_output
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,7 +17,7 @@ def _stream_cmd(
     env: Optional[dict] = None,
 ) -> None:
     """コマンドを実行し stderr をリアルタイムでログに出力する。"""
-    logger.info("Running: %s", " ".join(str(c) for c in cmd))
+    log_command_start(logger, cmd, step_name)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -26,7 +28,7 @@ def _stream_cmd(
     for line in iter(proc.stderr.readline, ""):
         line = line.rstrip()
         if line:
-            logger.info("[%s] %s", step_name, line)
+            log_tool_output(logger, step_name, line)
     proc.stderr.close()
     proc.wait()
     if proc.returncode != 0:
@@ -56,11 +58,19 @@ class MapDamageAnalyzer:
                 f"samtools view -b - | "
                 f"samtools sort -o {shlex.quote(str(sorted_filtered_bam))}"
             )
+            logger.info("外部ツールを実行します: mapDamage filtering %s", sample_acc)
+            logger.debug("実行コマンド (mapDamage filtering %s): %s", sample_acc, filter_cmd)
             subprocess.run(filter_cmd, shell=True, executable='/bin/bash', check=True)
             # インデックス作成（BAI）
-            subprocess.run(["samtools", "index", str(sorted_filtered_bam)], check=True)
+            index_cmd = ["samtools", "index", str(sorted_filtered_bam)]
+            log_command_start(logger, index_cmd, "samtools index")
+            subprocess.run(index_cmd, check=True)
         except subprocess.CalledProcessError as e:
-            logger.error(f"フィルタリングに失敗しました: {sample_acc}: {e}")
+            logger.error(
+                "mapDamage 前処理のフィルタリングに失敗しました: %s。確認: samtools、入力BAM、BAM index、参照ゲノムの状態を確認してください。詳細: %s",
+                sample_acc,
+                e,
+            )
             return None
         
         # Run mapDamage
@@ -75,7 +85,11 @@ class MapDamageAnalyzer:
             logger.info(f"mapDamageが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
-            logger.error(f"mapDamageに失敗しました: {sample_acc}: {e}")
+            logger.error(
+                "mapDamageに失敗しました: %s。確認: mapDamageのインストール、参照ゲノム、フィルタ済みBAMを確認してください。詳細: %s",
+                sample_acc,
+                e,
+            )
             return None
 
 class QualimapAnalyzer:
@@ -96,10 +110,14 @@ class QualimapAnalyzer:
         # 1. ファイル存在とサイズのチェック
         try:
             if dedup_bam is None or not dedup_bam.exists() or dedup_bam.stat().st_size == 0:
-                logger.warning(f"Qualimapをスキップします: {sample_acc}: BAMファイルが見つかりませんまたは空です ({dedup_bam})")
+                logger.warning(
+                    "Qualimapをスキップします: %s。理由: BAMファイルが見つからないか空です。確認: %s",
+                    sample_acc,
+                    dedup_bam,
+                )
                 return None
         except Exception as e:
-            logger.error(f"BAMファイルのステータスを取得に失敗しました: {sample_acc}: {e}")
+            logger.error("BAMファイルのステータス取得に失敗しました: %s。詳細: %s", sample_acc, e)
             return None
 
         # 2. マッピングされたリード数のチェック
@@ -112,10 +130,17 @@ class QualimapAnalyzer:
                 int(line.split()[2]) for line in idxstats.stdout.strip().split("\n") if line
             )
             if mapped_reads == 0:
-                logger.warning(f"Qualimapをスキップします: {sample_acc}: {dedup_bam} にマッピングされたリードがありません")
+                logger.warning(
+                    "Qualimapをスキップします: %s。理由: マッピングされたリードがありません。確認: 入力FASTQ、BWAマッピング結果、参照ゲノムの一致を確認してください。",
+                    sample_acc,
+                )
                 return None
         except subprocess.CalledProcessError as e:
-            logger.error(f"samtools idxstatsに失敗しました: {sample_acc}: {e}")
+            logger.error(
+                "samtools idxstatsに失敗しました: %s。確認: BAM indexが存在するか、BAMが壊れていないかを確認してください。詳細: %s",
+                sample_acc,
+                e,
+            )
             return None
         except FileNotFoundError:
             logger.error("samtoolsが見つかりません。samtoolsがインストールされているか、PATHに追加されているか確認してください。")
@@ -143,7 +168,11 @@ class QualimapAnalyzer:
             logger.info(f"Qualimapが完了しました: {sample_acc}")
             return sample_outdir
         except subprocess.CalledProcessError as e:
-            logger.error(f"Qualimapに失敗しました: {sample_acc}: {e}")
+            logger.error(
+                "Qualimapに失敗しました: %s。確認: Qualimap、Java設定、BAM index、メモリ設定を確認してください。詳細: %s",
+                sample_acc,
+                e,
+            )
             return None
 
 class HaplotypeCaller:
@@ -173,5 +202,9 @@ class HaplotypeCaller:
             logger.info(f"HaplotypeCallerが完了しました: {sample_acc}")
             return vcf_file
         except subprocess.CalledProcessError as e:
-            logger.error(f"HaplotypeCallerに失敗しました: {sample_acc}: {e}")
+            logger.error(
+                "HaplotypeCallerに失敗しました: %s。確認: GATK、reference.fa/.fai/.dict、BAM index、スレッド数を確認してください。詳細: %s",
+                sample_acc,
+                e,
+            )
             return None
