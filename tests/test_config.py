@@ -62,6 +62,12 @@ def test_parse_args_rejects_exclusive_input_modes(monkeypatch, tmp_path):
         parse_args()
 
 
+def test_parse_args_accepts_no_progress(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--no-progress"])
+
+    assert parse_args().no_progress is True
+
+
 def test_validate_environment_reports_missing_items(monkeypatch, tmp_path):
     ref = touch(tmp_path / "ref.fa")
     args = make_args(tmp_path, reference_genome=ref, picard_jar=tmp_path / "missing.jar")

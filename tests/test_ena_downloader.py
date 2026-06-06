@@ -10,7 +10,12 @@ def make_downloader(tmp_path, protocol="http", retries=2):
     raw_data_dir.mkdir(parents=True, exist_ok=True)
     config = SimpleNamespace(
         raw_data_dir=raw_data_dir,
-        args=SimpleNamespace(workers=2, download_protocol=protocol, max_retries=retries),
+        args=SimpleNamespace(
+            workers=2,
+            download_protocol=protocol,
+            max_retries=retries,
+            no_progress=True,
+        ),
     )
     return ENADownloader(config)
 

@@ -29,6 +29,10 @@ from modules.analyzers import (
 logger = logging.getLogger(__name__)
 
 
+def _progress_enabled(config: PipelineConfig) -> bool:
+    return not getattr(config.args, "no_progress", False)
+
+
 def _ensure_bam_index(bam_path: Path) -> bool:
     """Create a BAM index next to the BAM if it does not already exist."""
     bai_path = Path(str(bam_path) + ".bai")
@@ -53,6 +57,7 @@ def process_sample(
     sample_acc: str,
     runs: List[FastqRun],
     config: PipelineConfig,
+    progress_position: Optional[int] = None,
 ) -> Tuple[str, bool, str]:
     """
     1 サンプル分の解析パイプラインを実行する。
@@ -82,15 +87,33 @@ def process_sample(
     # ステップ数: ラン単位 3 ステップ × N ラン + サンプル単位 4 ステップ
     total_steps = 3 * len(runs) + 4
     current_step = 0
+    sample_pbar = tqdm(
+        total=total_steps,
+        desc=sample_acc,
+        unit="step",
+        position=progress_position,
+        leave=False,
+        dynamic_ncols=True,
+        disable=not _progress_enabled(config),
+    )
 
     def _log_progress(step_name: str) -> None:
         nonlocal current_step
         current_step += 1
         pct = int(current_step / total_steps * 100)
+        sample_pbar.set_description_str(f"{sample_acc} {step_name}")
+        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
+        sample_pbar.update(1)
         logger.info(
             "[%s] %d%% (%d/%d) %s",
             sample_acc, pct, current_step, total_steps, step_name,
         )
+
+    def _skip_progress(steps: int) -> None:
+        nonlocal current_step
+        current_step += steps
+        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
+        sample_pbar.update(steps)
 
     logger.info("サンプルの解析を開始します: %s (%d ラン, %d ステップ)", sample_acc, len(runs), total_steps)
 
@@ -114,7 +137,7 @@ def process_sample(
         if not bam_file:
             logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
             failed_runs.append(run_id)
-            current_step += 2
+            _skip_progress(2)
             continue
 
         # 2. Soft clipping
@@ -123,7 +146,7 @@ def process_sample(
         if not softclipped_bam:
             logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
             failed_runs.append(run_id)
-            current_step += 1
+            _skip_progress(1)
             continue
 
         cleanup_intermediate_file(bam_file, logger)
@@ -154,6 +177,7 @@ def process_sample(
 
     if not run_clean_bams:
         logger.error("有効なランがありません: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "all runs failed"
 
     # ------------------------------------------------------------------
@@ -166,9 +190,11 @@ def process_sample(
         dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
     except Exception:
         logger.exception("merge/dedup に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
     if not dedup_bam:
+        sample_pbar.close()
         return sample_acc, False, "merge/dedup"
 
     for bam in run_clean_bams:
@@ -179,6 +205,7 @@ def process_sample(
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
     # 6. Qualimap
@@ -186,6 +213,7 @@ def process_sample(
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
@@ -193,6 +221,7 @@ def process_sample(
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
     # 8. 最終クリーンアップ
@@ -205,6 +234,7 @@ def process_sample(
     done_flag.touch()
 
     logger.info("サンプルの解析を完了しました: %s", sample_acc)
+    sample_pbar.close()
     return sample_acc, True, ""
 
 
@@ -212,6 +242,7 @@ def process_sample_from_dedup_bam(
     sample_acc: str,
     dedup_bam: Path,
     config: PipelineConfig,
+    progress_position: Optional[int] = None,
 ) -> Tuple[str, bool, str]:
     """
     既存 dedup BAM から QC と VCF 出力のみを実行する。
@@ -242,11 +273,23 @@ def process_sample_from_dedup_bam(
 
     total_steps = 3
     current_step = 0
+    sample_pbar = tqdm(
+        total=total_steps,
+        desc=sample_acc,
+        unit="step",
+        position=progress_position,
+        leave=False,
+        dynamic_ncols=True,
+        disable=not _progress_enabled(config),
+    )
 
     def _log_progress(step_name: str) -> None:
         nonlocal current_step
         current_step += 1
         pct = int(current_step / total_steps * 100)
+        sample_pbar.set_description_str(f"{sample_acc} {step_name}")
+        sample_pbar.set_postfix_str(f"step {current_step}/{total_steps}", refresh=False)
+        sample_pbar.update(1)
         logger.info(
             "[%s] %d%% (%d/%d) %s",
             sample_acc, pct, current_step, total_steps, step_name,
@@ -258,24 +301,28 @@ def process_sample_from_dedup_bam(
     mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
     if not mapdamage_result:
         logger.error("mapDamage に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "mapDamage"
 
     _log_progress("Qualimap")
     qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
     if not qualimap_result:
         logger.error("Qualimap に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "Qualimap"
 
     _log_progress("HaplotypeCaller")
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+        sample_pbar.close()
         return sample_acc, False, "HaplotypeCaller"
 
     done_flag.parent.mkdir(parents=True, exist_ok=True)
     done_flag.touch()
 
     logger.info("既存 dedup BAM からの解析を完了しました: %s", sample_acc)
+    sample_pbar.close()
     return sample_acc, True, ""
 
 
@@ -290,7 +337,8 @@ def main() -> None:
     args = parse_args()
     config = PipelineConfig(args)
     log_file = config.logs_dir / f"pipeline_{config.project_accession}.log"
-    setup_logging(log_file=log_file)
+    progress_enabled = _progress_enabled(config)
+    setup_logging(log_file=log_file, use_tqdm=progress_enabled)
 
     logger.info(
         "解析パイプラインを開始します: project_accession=%s",
@@ -301,20 +349,20 @@ def main() -> None:
     if getattr(args, "download_via_https", False):
         logger.info("ena_download_https でダウンロードを実行します")
         out_dir = config.raw_data_dir.parent
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "modules.ena_download_https",
-                "--project",
-                config.project_accession,
-                "--out",
-                str(out_dir),
-                "--workers",
-                str(config.args.workers),
-            ],
-            check=True,
-        )
+        download_cmd = [
+            sys.executable,
+            "-m",
+            "modules.ena_download_https",
+            "--project",
+            config.project_accession,
+            "--out",
+            str(out_dir),
+            "--workers",
+            str(config.args.workers),
+        ]
+        if not progress_enabled:
+            download_cmd.append("--no-progress")
+        subprocess.run(download_cmd, check=True)
         config.fastq_dir = config.raw_data_dir
         logger.info("ダウンロード完了。解析を開始します")
 
@@ -429,38 +477,64 @@ def main() -> None:
         total_samples,
         parallel_samples,
     )
+    if progress_enabled:
+        logger.info(
+            "解析パイプライン: %s | 入力モード: %s | 対象サンプル: %d | 並列数: %d | スレッド/サンプル: %d",
+            config.project_accession,
+            "BAM" if bam_mode else "FASTQ",
+            total_samples,
+            parallel_samples,
+            config.args.threads,
+        )
 
     succeeded: List[str] = []
     failed: List[Tuple[str, str]] = []
 
     if parallel_samples <= 1:
-        sample_items = sample_to_bams.items() if bam_mode else sample_to_runs.items()
+        sample_items = list(sample_to_bams.items() if bam_mode else sample_to_runs.items())
         for sample_acc, sample_input in tqdm(
-            sample_items, desc="progress", unit="sample"
+            sample_items,
+            desc="全体進捗",
+            unit="sample",
+            position=0,
+            dynamic_ncols=True,
+            disable=not progress_enabled,
         ):
             if bam_mode:
                 acc, ok, step = process_sample_from_dedup_bam(
-                    sample_acc, sample_input, config,
+                    sample_acc, sample_input, config, progress_position=1,
                 )
             else:
-                acc, ok, step = process_sample(sample_acc, sample_input, config)
+                acc, ok, step = process_sample(
+                    sample_acc, sample_input, config, progress_position=1,
+                )
             if ok:
                 succeeded.append(acc)
             else:
                 failed.append((acc, step))
     else:
         with ThreadPoolExecutor(max_workers=parallel_samples) as executor:
+            sample_items = list(sample_to_bams.items() if bam_mode else sample_to_runs.items())
             if bam_mode:
                 future_to_acc = {
-                    executor.submit(process_sample_from_dedup_bam, acc, bam, config): acc
-                    for acc, bam in sample_to_bams.items()
+                    executor.submit(
+                        process_sample_from_dedup_bam, acc, bam, config, idx + 1,
+                    ): acc
+                    for idx, (acc, bam) in enumerate(sample_items)
                 }
             else:
                 future_to_acc = {
-                    executor.submit(process_sample, acc, runs, config): acc
-                    for acc, runs in sample_to_runs.items()
+                    executor.submit(process_sample, acc, runs, config, idx + 1): acc
+                    for idx, (acc, runs) in enumerate(sample_items)
                 }
-            with tqdm(total=total_samples, desc="progress", unit="sample") as pbar:
+            with tqdm(
+                total=total_samples,
+                desc="全体進捗",
+                unit="sample",
+                position=0,
+                dynamic_ncols=True,
+                disable=not progress_enabled,
+            ) as pbar:
                 for future in as_completed(future_to_acc):
                     acc = future_to_acc[future]
                     try:

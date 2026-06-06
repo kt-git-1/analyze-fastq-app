@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from tqdm import tqdm
+
 # Set up a module-level logger. 既存のロガーを使う場合は上書きされないようにします。
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ class ENADownloader:
         # Use command-line arguments if they exist, otherwise default values.
         self.protocol: str = getattr(config.args, "download_protocol", "http")
         self.max_retries: int = getattr(config.args, "max_retries", 3)
+        self.progress_enabled: bool = not getattr(config.args, "no_progress", False)
 
     def get_api_response(self, project_accession: str, session: requests.Session) -> str:
         """
@@ -190,8 +193,27 @@ class ENADownloader:
         with FTP(ftp_server) as ftp:
             ftp.login()
             ftp.cwd(os.path.dirname(ftp_path))
+            total_size = None
+            try:
+                total_size = ftp.size(filename)
+            except Exception:
+                total_size = None
             with open(destination, "wb") as fh:
-                ftp.retrbinary("RETR " + filename, fh.write)
+                with tqdm(
+                    total=total_size,
+                    desc=filename,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    dynamic_ncols=True,
+                    leave=False,
+                    disable=not self.progress_enabled,
+                ) as pbar:
+                    def _write_chunk(chunk: bytes) -> None:
+                        fh.write(chunk)
+                        pbar.update(len(chunk))
+
+                    ftp.retrbinary("RETR " + filename, _write_chunk)
         logger.info(f"{filename} を {destination} にダウンロードしました")
         return destination
 
@@ -225,10 +247,22 @@ class ENADownloader:
         # ストリーミングでダウンロードしながら保存
         with requests.get(http_url, stream=True, timeout=20) as resp:
             resp.raise_for_status()
+            total_size = int(resp.headers.get("Content-Length", 0))
             with open(destination, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        fh.write(chunk)
+                with tqdm(
+                    total=total_size if total_size else None,
+                    desc=filename,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    dynamic_ncols=True,
+                    leave=False,
+                    disable=not self.progress_enabled,
+                ) as pbar:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            fh.write(chunk)
+                            pbar.update(len(chunk))
         logger.info(f"{filename} を {destination} にダウンロードしました")
         return destination
 
@@ -291,12 +325,18 @@ class ENADownloader:
             download_func = self.download_from_http
 
         # ThreadPoolExecutor を用いた並列ダウンロード
+        gz_urls = [url for url in ftp_urls if url.endswith(".gz")]
+        if self.progress_enabled:
+            logger.info(
+                "ENA download: %s (%d files, workers=%d)",
+                sample_acc,
+                len(gz_urls),
+                self.config.args.workers,
+            )
         with ThreadPoolExecutor(max_workers=self.config.args.workers) as executor:
             future_to_url: dict = {}
-            for url in ftp_urls:
+            for url in gz_urls:
                 # FASTQ/GZ ファイルのみ対象
-                if not url.endswith(".gz"):
-                    continue
                 # 保存先ファイル名を決定
                 full_ftp_url = url if url.startswith("ftp://") else f"ftp://{url}"
                 path = urlparse(full_ftp_url).path
@@ -305,12 +345,22 @@ class ENADownloader:
                 future = executor.submit(download_func, url, dest_path)
                 future_to_url[future] = url
 
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    dest = future.result()
-                    fastq_files.append(dest)
-                except Exception as exc:
-                    # 既に _retry 内でエラーログを出力しているが、ここでも通知
-                    logger.error(f"{url} からダウンロードに失敗しました: {exc}")
+            with tqdm(
+                total=len(future_to_url),
+                desc=f"{sample_acc} 全体進捗",
+                unit="file",
+                dynamic_ncols=True,
+                leave=False,
+                disable=not self.progress_enabled,
+            ) as pbar:
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        dest = future.result()
+                        fastq_files.append(dest)
+                    except Exception as exc:
+                        # 既に _retry 内でエラーログを出力しているが、ここでも通知
+                        logger.error(f"{url} からダウンロードに失敗しました: {exc}")
+                    finally:
+                        pbar.update(1)
         return fastq_files

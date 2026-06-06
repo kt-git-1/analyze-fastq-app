@@ -292,6 +292,7 @@ BAM 入力モードでも同じ仕組みで `.done` を使います。
 | `--download_protocol` | ENA 通常ダウンロードで使うプロトコル (`ftp` / `http`) | `http` |
 | `--workers` | ダウンロード並列数 | `4` |
 | `--max_retries` | ダウンロード失敗時の再試行回数 | `3` |
+| `--no-progress` | 端末上の進捗バー表示を無効化し、通常ログのみ出力する | `False` |
 | `--data_type` | FASTQ 解析時のデータ種別 (`ancient` / `modern`) | `ancient` |
 | `--threads` | 解析ツールに渡すスレッド数 | `20` |
 | `--parallel_samples` | 同時に解析する sample 数 | `1` |
@@ -328,6 +329,18 @@ conda activate analyze-env
 参照ゲノムの `.fai` がない場合は `samtools faidx` で自動作成します。
 
 注意: BAM 入力モードでも、現状の環境検証は FASTQ 解析用ツールを含めて確認します。
+
+## 進捗表示
+
+通常実行では、端末に日本語ラベル付きの進捗バーを表示します。ステップ名は外部ツール名やログ検索との対応を保つため、`BWA mapping`、`Soft clipping`、`CleanSam`、`mapDamage`、`Qualimap`、`HaplotypeCaller` のように英語のまま表示されます。
+
+表示される主な情報:
+
+- ダウンロード中: 全体の完了ファイル数、各 FASTQ の転送量、速度、MD5 スキップ/再試行ログ
+- 解析中: 全体の完了 sample 数、各 sample の現在ステップ、step 数、Soft clipping の read 数
+- 終了時: 成功 sample 数、失敗 sample と失敗ステップ
+
+CI やログファイルだけを確認したい環境では、`--no-progress` を付けると進捗バーを無効化できます。
 
 ## ディレクトリ構成
 

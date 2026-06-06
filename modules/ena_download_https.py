@@ -11,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util.retry import Retry
 
+from config import TqdmLoggingHandler
 from modules.ena_downloader import ENADownloader, verify_file_md5
 
 
@@ -55,6 +56,7 @@ def download_via_https(
     destination: Path,
     chunk_size: int = 1024 * 1024,
     expected_md5: Optional[str] = None,
+    progress_enabled: bool = True,
 ) -> Path:
     """HTTPS ダウンロード（再開対応・MD5 検証付き）"""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -105,6 +107,8 @@ def download_via_https(
                     unit_divisor=1024,
                     desc=destination.name,
                     leave=False,
+                    dynamic_ncols=True,
+                    disable=not progress_enabled,
                 ) as pbar:
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         if chunk:
@@ -143,16 +147,20 @@ def download_via_https(
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
     parser = argparse.ArgumentParser(description="ENA downloader (HTTPS CLI for testing)")
     parser.add_argument("--project", required=True, help="ENA project accession (e.g. PRJEB19970)")
     parser.add_argument("--out", required=True, help="base output dir (e.g. /path/to/raw_data)")
     parser.add_argument("--workers", type=int, default=1, help="download workers (default: 1)")
+    parser.add_argument("--no-progress", action="store_true", help="disable terminal progress bars")
     args = parser.parse_args()
+    progress_enabled = not args.no_progress
+
+    handler = TqdmLoggingHandler() if progress_enabled else logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[handler],
+    )
 
     # プロジェクト番号ディレクトリを作成
     project_dir = Path(args.out) / args.project
@@ -179,33 +187,58 @@ def main():
         1 for pairs in sample_to_urls.values() for u, _ in pairs if u.endswith(".gz")
     )
     file_idx = 0
+    if progress_enabled:
+        logging.info(
+            "解析パイプライン: %s | 現在の処理: ENA download | 対象ファイル: %d | ダウンロード並列数: %d",
+            args.project,
+            total_files,
+            args.workers,
+        )
 
-    for sample_acc, url_md5_pairs in sample_to_urls.items():
-        sample_dir = project_dir / sample_acc
-        sample_dir.mkdir(parents=True, exist_ok=True)
+    with tqdm(
+        total=total_files,
+        desc="全体進捗",
+        unit="file",
+        position=0,
+        dynamic_ncols=True,
+        disable=not progress_enabled,
+    ) as overall_pbar:
+        for sample_acc, url_md5_pairs in sample_to_urls.items():
+            sample_dir = project_dir / sample_acc
+            sample_dir.mkdir(parents=True, exist_ok=True)
 
-        done_flag = sample_dir / ".done"
-        if done_flag.exists():
-            logging.info(f"SKIP (done): {sample_acc}")
-            file_idx += sum(1 for u, _ in url_md5_pairs if u.endswith(".gz"))
-            continue
-
-        for u, md5 in url_md5_pairs:
-            if not u.endswith(".gz"):
+            done_flag = sample_dir / ".done"
+            sample_file_count = sum(1 for u, _ in url_md5_pairs if u.endswith(".gz"))
+            if done_flag.exists():
+                logging.info(f"SKIP (done): {sample_acc}")
+                file_idx += sample_file_count
+                overall_pbar.update(sample_file_count)
                 continue
-            file_idx += 1
 
-            https_url = to_https_url(u)
-            filename = Path(urlparse(https_url).path).name
-            dest = sample_dir / filename
+            for u, md5 in url_md5_pairs:
+                if not u.endswith(".gz"):
+                    continue
+                file_idx += 1
 
-            logging.info(
-                "[%d/%d] %s / %s", file_idx, total_files, sample_acc, filename,
-            )
-            download_via_https(session_dl, https_url, dest, expected_md5=md5)
+                https_url = to_https_url(u)
+                filename = Path(urlparse(https_url).path).name
+                dest = sample_dir / filename
 
-        done_flag.touch()
-        logging.info(f"MARK DONE: {sample_acc}")
+                overall_pbar.set_postfix_str(f"{sample_acc} / {filename}", refresh=False)
+                logging.info(
+                    "[%d/%d] %s / %s", file_idx, total_files, sample_acc, filename,
+                )
+                download_via_https(
+                    session_dl,
+                    https_url,
+                    dest,
+                    expected_md5=md5,
+                    progress_enabled=progress_enabled,
+                )
+                overall_pbar.update(1)
+
+            done_flag.touch()
+            logging.info(f"MARK DONE: {sample_acc}")
 
 
 if __name__ == "__main__":

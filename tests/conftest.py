@@ -18,6 +18,7 @@ def make_config(tmp_path):
             download_protocol="http",
             max_retries=2,
             bam_pattern="*.bam",
+            no_progress=True,
         )
         config = SimpleNamespace(
             args=args,

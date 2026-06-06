@@ -6,6 +6,8 @@ import subprocess
 import sys
 from typing import List, Optional, Union
 
+from tqdm import tqdm
+
 logger = logging.getLogger(__name__)
 
 
@@ -244,6 +246,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="ena_download_https でダウンロードしてから解析を実行（再開対応・HTTPS）",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="端末上の進捗バー表示を無効化し、通常ログのみを出力する",
+    )
     args = parser.parse_args()
     if args.bam_dir and args.fastq_dir:
         parser.error("--bam_dir と --fastq_dir は同時に指定できません")
@@ -252,7 +259,18 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def setup_logging(log_file: Path) -> logging.Logger:
+class TqdmLoggingHandler(logging.StreamHandler):
+    """tqdm の進捗バーを崩さずにコンソールへログを出す。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logging(log_file: Path, use_tqdm: bool = False) -> logging.Logger:
     """
     パイプライン全体で使うロガーを初期化します。
     """
@@ -269,7 +287,7 @@ def setup_logging(log_file: Path) -> logging.Logger:
         for handler in logger.handlers
     )
     if not has_stream_handler:
-        stream_handler = logging.StreamHandler()
+        stream_handler = TqdmLoggingHandler() if use_tqdm else logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 

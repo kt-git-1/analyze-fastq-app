@@ -94,9 +94,12 @@ class SoftClipper:
 
                 pbar = tqdm(
                     total=total_reads,
-                    desc=f"Soft clipping ({run_id})",
+                    desc=f"{sample_acc} Soft clipping ({run_id})",
                     unit="reads",
                     unit_scale=True,
+                    dynamic_ncols=True,
+                    leave=False,
+                    disable=getattr(self.config.args, "no_progress", False),
                 )
 
                 while True:
