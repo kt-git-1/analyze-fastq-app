@@ -258,6 +258,8 @@ data/
   temp/
 ```
 
+VCF は sample ごとに出力されます。複数の run / lane / FASTQ が同じ sample に属する場合、それらは sample 単位で統合された dedup BAM から `<sample>.vcf` として1つ出力されます。
+
 `<project>` は通常 `--project_accession` です。`--fastq_dir` 指定時は FASTQ ディレクトリ名、`--bam_dir` 指定時は BAM ディレクトリ名が使われます。
 
 ## チェックポイントと再開
