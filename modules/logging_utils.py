@@ -3,6 +3,11 @@ import shlex
 from typing import Sequence
 
 
+SUPPRESSED_TOOL_OUTPUT_PATTERNS = (
+    "no version information available",
+)
+
+
 def format_command(cmd: Sequence[object]) -> str:
     """ログ用にコマンドを安全に1行へ整形する。"""
     return " ".join(shlex.quote(str(part)) for part in cmd)
@@ -22,4 +27,10 @@ def log_tool_output(
     step_name: str,
     line: str,
 ) -> None:
+    if should_suppress_tool_output(line):
+        return
     logger.debug("[%s] %s", step_name, line)
+
+
+def should_suppress_tool_output(line: str) -> bool:
+    return any(pattern in line for pattern in SUPPRESSED_TOOL_OUTPUT_PATTERNS)

@@ -288,10 +288,41 @@ class BWAMapper:
             stderr_thread = threading.Thread(target=_drain_bwa_stderr, daemon=True)
             stderr_thread.start()
 
-            view_proc = subprocess.Popen(view_cmd, stdin=bwa_proc.stdout, stdout=subprocess.PIPE)
+            view_proc = subprocess.Popen(
+                view_cmd,
+                stdin=bwa_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
             bwa_proc.stdout.close()
-            sort_proc = subprocess.Popen(sort_cmd, stdin=view_proc.stdout)
+            sort_proc = subprocess.Popen(
+                sort_cmd,
+                stdin=view_proc.stdout,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
             view_proc.stdout.close()
+
+            def _drain_text_stderr(proc, step_name: str) -> None:
+                for line in iter(proc.stderr.readline, ""):
+                    line = line.rstrip()
+                    if line:
+                        log_tool_output(logger, step_name, line)
+                proc.stderr.close()
+
+            view_stderr_thread = threading.Thread(
+                target=_drain_text_stderr,
+                args=(view_proc, "samtools view %s" % label),
+                daemon=True,
+            )
+            sort_stderr_thread = threading.Thread(
+                target=_drain_text_stderr,
+                args=(sort_proc, "samtools sort %s" % label),
+                daemon=True,
+            )
+            view_stderr_thread.start()
+            sort_stderr_thread.start()
 
             sort_proc.wait()
             if sort_proc.returncode != 0:
@@ -304,6 +335,8 @@ class BWAMapper:
                 raise subprocess.CalledProcessError(bwa_proc.returncode, bwa_cmd)
 
             stderr_thread.join(timeout=30)
+            view_stderr_thread.join(timeout=30)
+            sort_stderr_thread.join(timeout=30)
 
             logger.info("BWA マッピング完了: %s → %s", label, bam_out.name)
             return bam_out
