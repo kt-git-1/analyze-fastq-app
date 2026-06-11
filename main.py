@@ -65,6 +65,14 @@ def _log_failure_hint(sample_acc: str, step_name: str) -> None:
     )
 
 
+def _is_nonempty_file(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def _has_files(path: Path) -> bool:
+    return path.exists() and path.is_dir() and any(p.is_file() for p in path.rglob("*"))
+
+
 def _shorten_middle(text: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -267,6 +275,29 @@ def _ensure_bam_index(bam_path: Path) -> bool:
         return False
 
 
+def _existing_run_clean_bam(config: PipelineConfig, sample_acc: str, run_id: str) -> Optional[Path]:
+    clean_bam = (
+        config.results_dir
+        / sample_acc
+        / "runs"
+        / run_id
+        / "bam_files"
+        / f"{run_id}.clean.bam"
+    )
+    if _is_nonempty_file(clean_bam):
+        logger.info("再開: 既存CleanSam BAMを使用します: %s", clean_bam)
+        return clean_bam
+    return None
+
+
+def _existing_sample_dedup_bam(config: PipelineConfig, sample_acc: str) -> Optional[Path]:
+    dedup_bam = config.results_dir / sample_acc / "dedup" / f"{sample_acc}.dedup.sorted.bam"
+    if _is_nonempty_file(dedup_bam):
+        logger.info("再開: 既存dedup BAMを使用します: %s", dedup_bam)
+        return dedup_bam
+    return None
+
+
 # ============================================================
 # サンプル単位の解析関数
 # ============================================================
@@ -333,107 +364,130 @@ def process_sample(
     # ------------------------------------------------------------------
     run_clean_bams: List[Path] = []
     failed_runs: List[str] = []
+    dedup_bam = _existing_sample_dedup_bam(config, sample_acc) if not force else None
 
-    for run_idx, run in enumerate(runs, 1):
-        run_id = run.run_id
-        fastq_files = run.fastq_files
-        # 1. BWA マッピング
-        _log_progress(f"BWA mapping ({run_id}) [{run_idx}/{len(runs)}]")
-        bam_file = bwa_mapper.run_mapping_pipeline(
-            sample_acc,
-            run_id,
-            fastq_files,
-            rg_library=run.rg_library,
-        )
-        if not bam_file:
-            logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
-            _log_failure_hint(sample_acc, "BWA mapping")
-            failed_runs.append(run_id)
-            _skip_progress(2)
-            continue
+    if dedup_bam is not None:
+        if not _ensure_bam_index(dedup_bam):
+            return sample_acc, False, "samtools index"
+        _skip_progress(3 * len(runs) + 1)
+    else:
+        for run_idx, run in enumerate(runs, 1):
+            run_id = run.run_id
+            fastq_files = run.fastq_files
+            clean_bam = _existing_run_clean_bam(config, sample_acc, run_id) if not force else None
+            if clean_bam is not None:
+                run_clean_bams.append(clean_bam)
+                _skip_progress(3)
+                continue
 
-        # 2. Soft clipping
-        _log_progress(f"Soft clipping ({run_id})")
-        softclipped_bam = softclipper.run_softclipping(
-            sample_acc,
-            run_id,
-            bam_file,
-            progress_enabled=dashboard is None,
-        )
-        if not softclipped_bam:
-            logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
-            _log_failure_hint(sample_acc, "Soft clipping")
-            failed_runs.append(run_id)
-            _skip_progress(1)
-            continue
+            # 1. BWA マッピング
+            _log_progress(f"BWA mapping ({run_id}) [{run_idx}/{len(runs)}]")
+            bam_file = bwa_mapper.run_mapping_pipeline(
+                sample_acc,
+                run_id,
+                fastq_files,
+                rg_library=run.rg_library,
+            )
+            if not bam_file:
+                logger.error("マッピング失敗 → ラン %s をスキップ", run_id)
+                _log_failure_hint(sample_acc, "BWA mapping")
+                failed_runs.append(run_id)
+                _skip_progress(2)
+                continue
 
-        cleanup_intermediate_file(bam_file, logger)
+            # 2. Soft clipping
+            _log_progress(f"Soft clipping ({run_id})")
+            softclipped_bam = softclipper.run_softclipping(
+                sample_acc,
+                run_id,
+                bam_file,
+                progress_enabled=dashboard is None,
+            )
+            if not softclipped_bam:
+                logger.error("Soft clipping 失敗 → ラン %s をスキップ", run_id)
+                _log_failure_hint(sample_acc, "Soft clipping")
+                failed_runs.append(run_id)
+                _skip_progress(1)
+                continue
 
-        # 3. CleanSam (ラン単位)
-        _log_progress(f"CleanSam ({run_id})")
-        try:
-            clean_bam = bam_processor.process_run_bam(sample_acc, run_id, softclipped_bam)
-        except Exception:
-            logger.exception("CleanSam 失敗 → ラン %s をスキップ", run_id)
-            _log_failure_hint(sample_acc, "CleanSam")
-            failed_runs.append(run_id)
-            continue
+            cleanup_intermediate_file(bam_file, logger)
 
-        cleanup_intermediate_file(softclipped_bam, logger)
+            # 3. CleanSam (ラン単位)
+            _log_progress(f"CleanSam ({run_id})")
+            try:
+                clean_bam = bam_processor.process_run_bam(sample_acc, run_id, softclipped_bam)
+            except Exception:
+                logger.exception("CleanSam 失敗 → ラン %s をスキップ", run_id)
+                _log_failure_hint(sample_acc, "CleanSam")
+                failed_runs.append(run_id)
+                continue
 
-        if clean_bam:
-            run_clean_bams.append(clean_bam)
-        else:
-            failed_runs.append(run_id)
+            cleanup_intermediate_file(softclipped_bam, logger)
 
-    if failed_runs:
-        logger.warning(
-            "失敗したラン: %s (%d/%d)",
-            ", ".join(failed_runs),
-            len(failed_runs),
-            len(runs),
-        )
+            if clean_bam:
+                run_clean_bams.append(clean_bam)
+            else:
+                failed_runs.append(run_id)
 
-    if not run_clean_bams:
-        logger.error("有効なランがありません: %s", sample_acc)
-        _log_failure_hint(sample_acc, "all runs failed")
-        return sample_acc, False, "all runs failed"
+        if failed_runs:
+            logger.warning(
+                "失敗したラン: %s (%d/%d)",
+                ", ".join(failed_runs),
+                len(failed_runs),
+                len(runs),
+            )
+
+        if not run_clean_bams:
+            logger.error("有効なランがありません: %s", sample_acc)
+            _log_failure_hint(sample_acc, "all runs failed")
+            return sample_acc, False, "all runs failed"
 
     # ------------------------------------------------------------------
     # Phase 2: サンプル単位の処理
     # ------------------------------------------------------------------
 
     # 4. マージ + 重複除去
-    _log_progress("Merge + MarkDuplicates")
-    try:
-        dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
-    except Exception:
-        logger.exception("merge/dedup に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "merge/dedup")
-        return sample_acc, False, "merge/dedup"
+    if dedup_bam is None:
+        _log_progress("Merge + MarkDuplicates")
+        try:
+            dedup_bam = bam_processor.merge_and_dedup(sample_acc, run_clean_bams)
+        except Exception:
+            logger.exception("merge/dedup に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "merge/dedup")
+            return sample_acc, False, "merge/dedup"
 
-    if not dedup_bam:
-        _log_failure_hint(sample_acc, "merge/dedup")
-        return sample_acc, False, "merge/dedup"
+        if not dedup_bam:
+            _log_failure_hint(sample_acc, "merge/dedup")
+            return sample_acc, False, "merge/dedup"
 
-    for bam in run_clean_bams:
-        cleanup_intermediate_file(bam, logger)
+        for bam in run_clean_bams:
+            cleanup_intermediate_file(bam, logger)
 
     # 5. mapDamage
-    _log_progress("mapDamage")
-    mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
-    if not mapdamage_result:
-        logger.error("mapDamage に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "mapDamage")
-        return sample_acc, False, "mapDamage"
+    mapdamage_dir = config.results_dir / sample_acc / "mapdamage"
+    if not force and _has_files(mapdamage_dir):
+        logger.info("再開: 既存mapDamage出力を使用します: %s", mapdamage_dir)
+        _skip_progress(1)
+    else:
+        _log_progress("mapDamage")
+        mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
+        if not mapdamage_result:
+            logger.error("mapDamage に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "mapDamage")
+            return sample_acc, False, "mapDamage"
 
     # 6. Qualimap
-    _log_progress("Qualimap")
-    qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
-    if not qualimap_result:
-        logger.error("Qualimap に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "Qualimap")
-        return sample_acc, False, "Qualimap"
+    qualimap_dir = config.results_dir / sample_acc / "qualimap"
+    if not force and _has_files(qualimap_dir):
+        logger.info("再開: 既存Qualimap出力を使用します: %s", qualimap_dir)
+        _skip_progress(1)
+    else:
+        _log_progress("Qualimap")
+        qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
+        if not qualimap_result:
+            logger.error("Qualimap に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "Qualimap")
+            return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
     _log_progress("HaplotypeCaller")
@@ -510,19 +564,33 @@ def process_sample_from_dedup_bam(
 
     logger.info("既存 dedup BAM から解析を開始します: %s (%s)", sample_acc, dedup_bam)
 
-    _log_progress("mapDamage")
-    mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
-    if not mapdamage_result:
-        logger.error("mapDamage に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "mapDamage")
-        return sample_acc, False, "mapDamage"
+    mapdamage_dir = config.results_dir / sample_acc / "mapdamage"
+    if not force and _has_files(mapdamage_dir):
+        logger.info("再開: 既存mapDamage出力を使用します: %s", mapdamage_dir)
+        current_step += 1
+        if dashboard is not None:
+            dashboard.skip_steps(sample_acc, current_step, total_steps)
+    else:
+        _log_progress("mapDamage")
+        mapdamage_result = mapdamage_analyzer.run_mapdamage(sample_acc, dedup_bam)
+        if not mapdamage_result:
+            logger.error("mapDamage に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "mapDamage")
+            return sample_acc, False, "mapDamage"
 
-    _log_progress("Qualimap")
-    qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
-    if not qualimap_result:
-        logger.error("Qualimap に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "Qualimap")
-        return sample_acc, False, "Qualimap"
+    qualimap_dir = config.results_dir / sample_acc / "qualimap"
+    if not force and _has_files(qualimap_dir):
+        logger.info("再開: 既存Qualimap出力を使用します: %s", qualimap_dir)
+        current_step += 1
+        if dashboard is not None:
+            dashboard.skip_steps(sample_acc, current_step, total_steps)
+    else:
+        _log_progress("Qualimap")
+        qualimap_result = qualimap_analyzer.run_qualimap(sample_acc, dedup_bam)
+        if not qualimap_result:
+            logger.error("Qualimap に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "Qualimap")
+            return sample_acc, False, "Qualimap"
 
     _log_progress("HaplotypeCaller")
     vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)

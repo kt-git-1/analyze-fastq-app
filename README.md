@@ -266,6 +266,8 @@ VCF は sample ごとに出力されます。複数の run / lane / FASTQ が同
 
 各 sample の解析が成功すると、`data/results/<project>/<sample>/.done` が作成されます。再実行時は `.done` がある sample をスキップします。
 
+未完了 sample は、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は BWA mapping / Soft clipping / CleanSam / MarkDuplicates を再実行せず、QC / HaplotypeCaller 側へ進みます。`mapdamage/` や `qualimap/` の既存出力がある場合も再利用します。
+
 全 sample を強制的に再実行する場合:
 
 ```sh
@@ -395,7 +397,7 @@ analyze-fastq-app/
 
 ### 途中で失敗した sample だけ再実行したい
 
-同じコマンドを再実行してください。`.done` がある sample はスキップされ、未完了 sample だけ実行されます。すべてやり直す場合は `--force` を指定します。
+同じコマンドを再実行してください。`.done` がある sample はスキップされ、未完了 sample は既存の中間成果物から再開します。すべてやり直す場合は `--force` を指定します。
 
 ### Qualimap で `MaxPermSize` エラーが出る
 
