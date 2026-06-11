@@ -141,6 +141,19 @@ class AnalysisDashboard:
         self._rendered_lines = 0
         self._last_rendered_at = 0.0
         self._lock = threading.Lock()
+        self._closed = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        if self.enabled:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat,
+                name="analysis-dashboard-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self._closed.wait(1.0):
+            self.render()
 
     def add_event(self, message: str) -> None:
         with self._lock:
@@ -252,6 +265,9 @@ class AnalysisDashboard:
         self._last_rendered_at = now
 
     def close(self) -> None:
+        self._closed.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2)
         self.render(force=True)
         if self.enabled:
             sys.stderr.write("\n")
