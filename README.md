@@ -15,6 +15,7 @@ FASTQ の取得、前処理、BWA マッピング、BAM 処理、QC、VCF 出力
 - 既存 dedup BAM から mapDamage / Qualimap / HaplotypeCaller だけを実行する
 - `.done` チェックポイントで完了済みサンプルをスキップし、途中から再開する
 - `--parallel_samples` でサンプル単位に並列実行する
+- `data_type=ancient` では final dedup BAM から pseudo-haploid matrix を作り、cohort PCA/MDS を実行する
 
 ## Quick Start
 
@@ -33,6 +34,17 @@ python main.py \
 python main.py \
   --fastq_dir ./my_fastqs \
   --reference_genome ./data/reference/equCab3.nochrUn.fa
+```
+
+### ancient DNA の PCA/MDS まで実行
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./horse_common_sites.vcf
 ```
 
 `--fastq_dir` には、解析したい FASTQ 群をまとめて含むフォルダを指定します。
@@ -126,7 +138,7 @@ sample 単位の処理
 .done 作成
 ```
 
-FASTQ から作成された最終 dedup BAM と index は、QC / VCF 完了後に中間ファイルとして削除されます。
+FASTQ から作成された run 単位の BAM や merge/marking 中間 BAM は、全 sample の解析が終了した後に成功 sample 分だけまとめて削除されます。最終 dedup BAM と index は、再開や後段の cohort/PCA 解析に使えるよう残します。
 
 ### ancient と modern の違い
 
@@ -247,7 +259,28 @@ sample 名は BAM ファイル名から推定します。次の suffix を取り
 ```text
 data/
   raw_data/<project>/                 # ダウンロード FASTQ
+  results/<project>/sample_qc_summary.tsv
+  results/<project>/cohort/
+    pca_sites.tsv
+    pseudohaploid_raw_calls.tsv
+    pseudohaploid_matrix.tsv
+    pseudohaploid_matrix.filtered.tsv
+    pca_qc_summary.tsv
+    eigenstrat/
+      cohort.geno
+      cohort.snp
+      cohort.ind
+    plink/
+      cohort.tped
+      cohort.tfam
+    pca/
+      pca_scores.tsv
+      pca_variance.tsv
+      mds.tsv
   results/<project>/<sample>/
+    dedup/
+      <sample>.dedup.sorted.bam
+      <sample>.dedup.sorted.bam.bai
     mapdamage/
     qualimap/
     vcf_files/
@@ -260,13 +293,21 @@ data/
 
 VCF は sample ごとに出力されます。複数の run / lane / FASTQ が同じ sample に属する場合、それらは sample 単位で統合された dedup BAM から `<sample>.vcf` として1つ出力されます。
 
+`--data_type ancient` の HaplotypeCaller VCF は raw diploid 候補確認用です。低深度 ancient DNA の PCA/MDS では、この単一 sample VCF を直接入力にせず、保持された final dedup BAM から pseudo-haploid な cohort matrix を作成してください。
+
+`sample_qc_summary.tsv` には、成功 sample ごとの final dedup BAM、Qualimap主要指標、VCF件数、ancient PCA向けの注意メモが集約されます。
+
+`--run-pca --pca-sites <sites.vcf>` を指定すると、全 sample 完了後に `data_type=ancient` 向けの cohort PCA/MDS stage を実行します。保持された final dedup BAM から指定SNP座位の allele を抽出し、pseudo-haploid matrix、EIGENSTRAT互換ファイル、PLINK text形式、PCA/MDS結果を出力します。途中成果物が存在する場合は再利用され、`--force` 指定時のみ作り直します。
+
 `<project>` は通常 `--project_accession` です。`--fastq_dir` 指定時は FASTQ ディレクトリ名、`--bam_dir` 指定時は BAM ディレクトリ名が使われます。
 
 ## チェックポイントと再開
 
 各 sample の解析が成功すると、`data/results/<project>/<sample>/.done` が作成されます。再実行時は `.done` がある sample をスキップします。
 
-未完了 sample は、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は BWA mapping / Soft clipping / CleanSam / MarkDuplicates を再実行せず、QC / HaplotypeCaller 側へ進みます。`mapdamage/` や `qualimap/` の既存出力がある場合も再利用します。
+未完了 sample は、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は BWA mapping / Soft clipping / CleanSam / MarkDuplicates を再実行せず、QC / HaplotypeCaller 側へ進みます。`mapdamage/`、`qualimap/`、`vcf_files/<sample>.vcf` の既存出力がある場合も再利用します。
+
+FASTQ 解析では、run 単位の BAM や一時ファイルは sample ごとに即時削除せず、全 sample の処理が終わってから成功 sample 分だけまとめて削除します。失敗 sample の中間ファイルは原因調査と再開のため残します。最終 dedup BAM と index は後段解析用に保持します。
 
 全 sample を強制的に再実行する場合:
 
@@ -298,6 +339,8 @@ BAM 入力モードでも同じ仕組みで `.done` を使います。
 | `--data_type` | FASTQ 解析時のデータ種別 (`ancient` / `modern`) | `ancient` |
 | `--threads` | 解析ツールに渡すスレッド数 | `20` |
 | `--parallel_samples` | 同時に解析する sample 数 | `1` |
+| `--run-pca` | 全 sample 完了後に ancient DNA 向け cohort PCA/MDS stage を実行する | `False` |
+| `--pca-sites` | PCA/MDSで比較する共通SNPリスト (`VCF` または BED-like text) | `None` |
 | `--java_mem` | Picard など Java ツール用メモリ | `10g` |
 | `--picard_jar` | Picard jar のパス | `/usr/local/bin/picard.jar` |
 | `--rg_library` | BWA read group の library (`LB`) | `unknown` |

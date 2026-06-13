@@ -1,0 +1,4 @@
+analysis_accession	sample_accession	analysis_type	submitted_ftp
+ERZ3034366	SAMEA9533171	REFERENCE_ALIGNMENT	ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034366/18ELTu18_AMIS-1-01102_Spa_m588.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam;ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034366/18ELTu18_AMIS-1-01102_Spa_m588.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam.bai
+ERZ3034367	SAMEA9533172	REFERENCE_ALIGNMENT	ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034367/AC7970_AMIS-1-00131_Tur_m290.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam;ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034367/AC7970_AMIS-1-00131_Tur_m290.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam.bai
+ERZ3034370	SAMEA9533174	REFERENCE_ALIGNMENT	ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034370/AC9016_AMIS-1-00134_Tur_m1900.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam;ftp.sra.ebi.ac.uk/vol1/analysis/ERZ303/ERZ3034370/AC9016_AMIS-1-00134_Tur_m1900.Bowtie2.EquCab3.pmds1.r.t.m.s.q25.bam.bai

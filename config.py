@@ -251,11 +251,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="端末上の進捗バー表示を無効化し、通常ログのみを出力する",
     )
+    parser.add_argument(
+        "--run-pca",
+        action="store_true",
+        help="全サンプル完了後に ancient DNA 向け cohort PCA/MDS stage を実行する",
+    )
+    parser.add_argument(
+        "--pca-sites",
+        type=Path,
+        default=None,
+        help="PCA/MDSで比較する共通SNPリスト (VCF または BED-like text)",
+    )
     args = parser.parse_args()
     if args.bam_dir and args.fastq_dir:
         parser.error("--bam_dir と --fastq_dir は同時に指定できません")
     if args.bam_dir and args.download_via_https:
         parser.error("--bam_dir と --download-via-https は同時に指定できません")
+    if args.run_pca and args.pca_sites is None:
+        parser.error("--run-pca には --pca-sites が必要です")
+    if args.run_pca and args.data_type != "ancient":
+        parser.error("--run-pca は現在 --data_type ancient のみ対応しています")
     return args
 
 

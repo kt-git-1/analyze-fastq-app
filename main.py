@@ -4,6 +4,8 @@ import logging
 import shutil
 import threading
 import time
+import re
+import csv
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -28,6 +30,7 @@ from modules.analyzers import (
     QualimapAnalyzer,
     HaplotypeCaller,
 )
+from modules.cohort_pca import run_cohort_pca
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,154 @@ def _is_nonempty_file(path: Path) -> bool:
 
 def _has_files(path: Path) -> bool:
     return path.exists() and path.is_dir() and any(p.is_file() for p in path.rglob("*"))
+
+
+def _cleanup_completed_fastq_intermediates(
+    config: PipelineConfig,
+    succeeded_samples: List[str],
+) -> None:
+    """
+    FASTQ 由来サンプルの中間ファイルを全サンプル処理後にまとめて削除する。
+
+    final dedup BAM は後段の cohort/PCA 解析や再開に使えるため残す。
+    """
+    for sample_acc in succeeded_samples:
+        sample_dir = config.results_dir / sample_acc
+
+        runs_dir = sample_dir / "runs"
+        if runs_dir.exists():
+            try:
+                shutil.rmtree(runs_dir)
+                logger.info("中間ディレクトリを削除しました: %s", runs_dir)
+            except OSError as exc:
+                logger.warning("中間ディレクトリを削除できませんでした: %s (%s)", runs_dir, exc)
+
+        dedup_dir = sample_dir / "dedup"
+        for suffix in ("merged.bam", "marked.bam"):
+            cleanup_intermediate_file(dedup_dir / f"{sample_acc}.{suffix}", logger)
+
+        temp_sample_dir = config.temp_dir / sample_acc
+        if temp_sample_dir.exists():
+            try:
+                shutil.rmtree(temp_sample_dir)
+                logger.info("一時ディレクトリを削除しました: %s", temp_sample_dir)
+            except OSError as exc:
+                logger.warning("一時ディレクトリを削除できませんでした: %s (%s)", temp_sample_dir, exc)
+
+
+def _parse_number(text: str) -> str:
+    return text.replace(",", "").replace("bp", "").replace("X", "").strip()
+
+
+def _parse_qualimap_results(path: Path) -> Dict[str, str]:
+    metrics: Dict[str, str] = {}
+    if not path.exists():
+        return metrics
+
+    patterns = {
+        "qualimap_total_reads": r"number of reads = ([\d,]+)",
+        "qualimap_mapped_reads": r"number of mapped reads = ([\d,]+)",
+        "qualimap_duplication_rate": r"duplication rate = ([\d.]+%)",
+        "qualimap_mean_insert_size": r"mean insert size = ([\d.,]+)",
+        "qualimap_median_insert_size": r"median insert size = ([\d.,]+)",
+        "qualimap_mean_mapping_quality": r"mean mapping quality = ([\d.]+)",
+        "qualimap_gc_percentage": r"GC percentage = ([\d.]+%)",
+        "qualimap_error_rate": r"general error rate = ([\d.]+)",
+        "qualimap_mean_coverage": r"mean coverageData = ([\d.]+)X",
+        "qualimap_reference_ge_1x": r"There is a ([\d.]+%) of reference with a coverageData >= 1X",
+        "qualimap_reference_ge_2x": r"There is a ([\d.]+%) of reference with a coverageData >= 2X",
+        "qualimap_reference_ge_3x": r"There is a ([\d.]+%) of reference with a coverageData >= 3X",
+    }
+
+    for line in path.read_text(errors="replace").splitlines():
+        for key, pattern in patterns.items():
+            if key in metrics:
+                continue
+            match = re.search(pattern, line)
+            if match:
+                metrics[key] = _parse_number(match.group(1))
+
+    return metrics
+
+
+def _count_vcf_variants(path: Path) -> str:
+    if not path.exists():
+        return ""
+    count = 0
+    with path.open(errors="replace") as handle:
+        for line in handle:
+            if line and not line.startswith("#"):
+                count += 1
+    return str(count)
+
+
+def _write_sample_qc_summary(
+    config: PipelineConfig,
+    samples: List[str],
+) -> Optional[Path]:
+    if not samples:
+        return None
+
+    summary_file = config.results_dir / "sample_qc_summary.tsv"
+    fields = [
+        "sample",
+        "data_type",
+        "done",
+        "dedup_bam",
+        "dedup_bam_index",
+        "mapdamage_dir",
+        "qualimap_report",
+        "vcf_file",
+        "vcf_variants",
+        "qualimap_total_reads",
+        "qualimap_mapped_reads",
+        "qualimap_mean_coverage",
+        "qualimap_reference_ge_1x",
+        "qualimap_reference_ge_2x",
+        "qualimap_reference_ge_3x",
+        "qualimap_mean_mapping_quality",
+        "qualimap_gc_percentage",
+        "qualimap_duplication_rate",
+        "qualimap_mean_insert_size",
+        "qualimap_median_insert_size",
+        "qualimap_error_rate",
+        "ancient_pca_note",
+    ]
+
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    with summary_file.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        for sample_acc in sorted(samples):
+            sample_dir = config.results_dir / sample_acc
+            dedup_bam = sample_dir / "dedup" / f"{sample_acc}.dedup.sorted.bam"
+            dedup_bai = Path(str(dedup_bam) + ".bai")
+            mapdamage_dir = sample_dir / "mapdamage"
+            qualimap_report = sample_dir / "qualimap" / "genome_results.txt"
+            vcf_file = sample_dir / "vcf_files" / f"{sample_acc}.vcf"
+
+            row = {
+                "sample": sample_acc,
+                "data_type": config.data_type,
+                "done": str((sample_dir / ".done").exists()).lower(),
+                "dedup_bam": str(dedup_bam) if dedup_bam.exists() else "",
+                "dedup_bam_index": str(dedup_bai) if dedup_bai.exists() else "",
+                "mapdamage_dir": str(mapdamage_dir) if mapdamage_dir.exists() else "",
+                "qualimap_report": str(qualimap_report) if qualimap_report.exists() else "",
+                "vcf_file": str(vcf_file) if vcf_file.exists() else "",
+                "vcf_variants": _count_vcf_variants(vcf_file),
+                "ancient_pca_note": (
+                    "use final dedup BAM for pseudo-haploid cohort PCA; "
+                    "single-sample HaplotypeCaller VCF is not PCA input"
+                    if config.data_type == "ancient"
+                    else ""
+                ),
+            }
+            row.update(_parse_qualimap_results(qualimap_report))
+            writer.writerow({field: row.get(field, "") for field in fields})
+
+    logger.info("sample QC summary を出力しました: %s", summary_file)
+    return summary_file
 
 
 def _shorten_middle(text: str, width: int) -> str:
@@ -314,6 +465,36 @@ def _existing_sample_dedup_bam(config: PipelineConfig, sample_acc: str) -> Optio
     return None
 
 
+def _existing_sample_vcf(config: PipelineConfig, sample_acc: str) -> Optional[Path]:
+    vcf_file = config.results_dir / sample_acc / "vcf_files" / f"{sample_acc}.vcf"
+    if _is_nonempty_file(vcf_file):
+        logger.info("再開: 既存HaplotypeCaller VCFを使用します: %s", vcf_file)
+        return vcf_file
+    return None
+
+
+def _run_or_reuse_haplotypecaller(
+    haplotypecaller: HaplotypeCaller,
+    sample_acc: str,
+    dedup_bam: Path,
+    config: PipelineConfig,
+) -> Optional[Path]:
+    force: bool = getattr(config.args, "force", False)
+    if not force:
+        existing_vcf = _existing_sample_vcf(config, sample_acc)
+        if existing_vcf is not None:
+            return existing_vcf
+
+    vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
+    if vcf_file and config.data_type == "ancient":
+        logger.info(
+            "ancient sample の HaplotypeCaller VCF は raw diploid 候補確認用です。"
+            "PCA/MDS では final dedup BAM から pseudo-haploid cohort matrix を作成してください: %s",
+            sample_acc,
+        )
+    return vcf_file
+
+
 # ============================================================
 # サンプル単位の解析関数
 # ============================================================
@@ -426,8 +607,6 @@ def process_sample(
                 _skip_progress(1)
                 continue
 
-            cleanup_intermediate_file(bam_file, logger)
-
             # 3. CleanSam (ラン単位)
             _log_progress(f"CleanSam ({run_id})")
             try:
@@ -437,8 +616,6 @@ def process_sample(
                 _log_failure_hint(sample_acc, "CleanSam")
                 failed_runs.append(run_id)
                 continue
-
-            cleanup_intermediate_file(softclipped_bam, logger)
 
             if clean_bam:
                 run_clean_bams.append(clean_bam)
@@ -477,7 +654,7 @@ def process_sample(
             return sample_acc, False, "merge/dedup"
 
         for bam in run_clean_bams:
-            cleanup_intermediate_file(bam, logger)
+            logger.debug("ラン単位 clean BAM はパイプライン末尾まで保持します: %s", bam)
 
     # 5. mapDamage
     mapdamage_dir = config.results_dir / sample_acc / "mapdamage"
@@ -507,18 +684,18 @@ def process_sample(
 
     # 7. HaplotypeCaller
     _log_progress("HaplotypeCaller")
-    vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
+    vcf_file = _run_or_reuse_haplotypecaller(
+        haplotypecaller,
+        sample_acc,
+        dedup_bam,
+        config,
+    )
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "HaplotypeCaller")
         return sample_acc, False, "HaplotypeCaller"
 
-    # 8. 最終クリーンアップ
-    dedup_bam_index = Path(str(dedup_bam) + ".bai")
-    cleanup_intermediate_file(dedup_bam_index, logger)
-    cleanup_intermediate_file(dedup_bam, logger)
-
-    # 9. チェックポイント (.done) を記録
+    # 8. チェックポイント (.done) を記録
     done_flag.parent.mkdir(parents=True, exist_ok=True)
     done_flag.touch()
 
@@ -609,7 +786,12 @@ def process_sample_from_dedup_bam(
             return sample_acc, False, "Qualimap"
 
     _log_progress("HaplotypeCaller")
-    vcf_file = haplotypecaller.run_haplotypecaller(sample_acc, dedup_bam)
+    vcf_file = _run_or_reuse_haplotypecaller(
+        haplotypecaller,
+        sample_acc,
+        dedup_bam,
+        config,
+    )
     if not vcf_file:
         logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
         _log_failure_hint(sample_acc, "HaplotypeCaller")
@@ -837,6 +1019,20 @@ def main() -> None:
         dashboard.close()
         if progress_enabled:
             _set_stream_log_level(logging.INFO)
+
+    if succeeded:
+        _write_sample_qc_summary(config, succeeded)
+
+    if getattr(args, "run_pca", False):
+        try:
+            run_cohort_pca(config, succeeded, force=getattr(args, "force", False))
+        except Exception:
+            logger.exception("cohort PCA/MDS stage に失敗しました")
+            sys.exit(1)
+
+    if not bam_mode and succeeded:
+        logger.info("成功サンプルの中間ファイルをまとめて削除します")
+        _cleanup_completed_fastq_intermediates(config, succeeded)
 
     # 8. サマリーを出力
     logger.info("=" * 60)

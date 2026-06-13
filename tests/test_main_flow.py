@@ -65,11 +65,13 @@ class FakeQualimapAnalyzer:
 
 class FakeHaplotypeCaller:
     result = Path("sample.vcf")
+    calls = []
 
     def __init__(self, config):
         pass
 
     def run_haplotypecaller(self, sample_acc, bam):
+        self.calls.append((sample_acc, bam))
         return self.result
 
 
@@ -93,6 +95,7 @@ def reset_fake_results():
     FakeMapDamageAnalyzer.result = Path("mapdamage")
     FakeQualimapAnalyzer.result = Path("qualimap")
     FakeHaplotypeCaller.result = Path("sample.vcf")
+    FakeHaplotypeCaller.calls = []
 
 
 def test_process_sample_skips_done_when_not_forced(make_config):
@@ -110,6 +113,74 @@ def test_process_sample_success_creates_done(monkeypatch, make_config):
 
     assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], cfg) == ("S1", True, "")
     assert (cfg.results_dir / "S1" / ".done").exists()
+
+
+def test_process_sample_reuses_existing_vcf(monkeypatch, make_config):
+    reset_fake_results()
+    patch_pipeline_classes(monkeypatch)
+    cfg = make_config()
+    existing_vcf = cfg.results_dir / "S1" / "vcf_files" / "S1.vcf"
+    touch(existing_vcf)
+
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], cfg) == ("S1", True, "")
+    assert FakeHaplotypeCaller.calls == []
+
+
+def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config):
+    cfg = make_config()
+    sample_dir = cfg.results_dir / "S1"
+    runs_file = touch(sample_dir / "runs" / "RUN1" / "bam_files" / "RUN1.sorted.bam")
+    merged_bam = touch(sample_dir / "dedup" / "S1.merged.bam")
+    marked_bam = touch(sample_dir / "dedup" / "S1.marked.bam")
+    final_bam = touch(sample_dir / "dedup" / "S1.dedup.sorted.bam")
+    final_bai = touch(sample_dir / "dedup" / "S1.dedup.sorted.bam.bai")
+    temp_file = touch(cfg.temp_dir / "S1" / "RUN1.pair1.truncated")
+
+    main_module._cleanup_completed_fastq_intermediates(cfg, ["S1"])
+
+    assert not runs_file.exists()
+    assert not merged_bam.exists()
+    assert not marked_bam.exists()
+    assert not temp_file.exists()
+    assert final_bam.exists()
+    assert final_bai.exists()
+
+
+def test_write_sample_qc_summary(make_config):
+    cfg = make_config()
+    sample_dir = cfg.results_dir / "S1"
+    touch(sample_dir / ".done")
+    touch(sample_dir / "dedup" / "S1.dedup.sorted.bam")
+    touch(sample_dir / "dedup" / "S1.dedup.sorted.bam.bai")
+    touch(sample_dir / "mapdamage" / "Runtime_log.txt")
+    touch(
+        sample_dir / "qualimap" / "genome_results.txt",
+        b"""number of reads = 1,000
+number of mapped reads = 250 (25%)
+duplication rate = 3.43%
+mean insert size = 109.1
+median insert size = 95
+mean mapping quality = 53.4
+GC percentage = 42.38%
+general error rate = 0.0074
+mean coverageData = 1.0108X
+There is a 57.1% of reference with a coverageData >= 1X
+There is a 22.37% of reference with a coverageData >= 2X
+There is a 7% of reference with a coverageData >= 3X
+""",
+    )
+    touch(
+        sample_dir / "vcf_files" / "S1.vcf",
+        b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\nchr1\t1\t.\tA\tG\t30\t.\t.\n",
+    )
+
+    out = main_module._write_sample_qc_summary(cfg, ["S1"])
+
+    text = out.read_text()
+    assert "sample\tdata_type\tdone" in text
+    assert "S1\tancient\ttrue" in text
+    assert "\t1\t1000\t250\t1.0108\t57.1\t22.37\t7\t53.4" in text
+    assert "pseudo-haploid cohort PCA" in text
 
 
 def test_process_sample_maps_all_fastq_runs_and_merges_outputs(monkeypatch, make_config):

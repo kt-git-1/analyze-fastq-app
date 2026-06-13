@@ -68,6 +68,24 @@ def test_parse_args_accepts_no_progress(monkeypatch):
     assert parse_args().no_progress is True
 
 
+def test_parse_args_requires_pca_sites_for_run_pca(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--run-pca"])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_parse_args_rejects_pca_for_modern(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--run-pca", "--pca-sites", str(tmp_path / "sites.vcf"), "--data_type", "modern"],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
 def test_validate_environment_reports_missing_items(monkeypatch, tmp_path):
     ref = touch(tmp_path / "ref.fa")
     args = make_args(tmp_path, reference_genome=ref, picard_jar=tmp_path / "missing.jar")

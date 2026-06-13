@@ -1,21 +1,11 @@
-import subprocess
 import logging
+import subprocess
 from pathlib import Path
 from typing import List, Optional
 
 from modules.logging_utils import log_command_start, log_tool_output
 
 logger = logging.getLogger(__name__)
-
-
-def _remove_intermediate(path: Path) -> None:
-    """中間 BAM を削除する。存在しなければ何もしない。"""
-    try:
-        if path.exists():
-            path.unlink()
-            logger.info("中間ファイルを削除しました: %s", path)
-    except OSError as exc:
-        logger.warning("中間ファイルを削除できませんでした: %s (%s)", path, exc)
 
 
 class BAMProcessor:
@@ -112,7 +102,6 @@ class BAMProcessor:
             ],
             "Picard MarkDuplicates",
         )
-        _remove_intermediate(merged_bam)
 
         # --- sort ---
         final_bam = sample_dedup_dir / f"{sample_acc}.dedup.sorted.bam"
@@ -120,7 +109,6 @@ class BAMProcessor:
             ["samtools", "sort", "-o", str(final_bam), str(marked_bam)],
             "samtools sort (dedup)",
         )
-        _remove_intermediate(marked_bam)
 
         # --- index ---
         self._run_cmd(
