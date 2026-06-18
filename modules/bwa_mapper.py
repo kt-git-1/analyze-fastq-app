@@ -13,6 +13,10 @@ class BWAMapper:
     def __init__(self, config):
         self.config = config
 
+    @staticmethod
+    def _adapter_output_path(temp_prefix: Path, suffix: str) -> Path:
+        return Path(str(temp_prefix) + suffix)
+
     def run_mapping_pipeline(
         self,
         sample_acc: str,
@@ -80,7 +84,7 @@ class BWAMapper:
                 logger.error("AdapterRemoval に失敗しました: %s / %s: %s", sample_acc, run_id, e)
                 return None
 
-            temp_single = temp_prefix.with_suffix(".truncated")
+            temp_single = self._adapter_output_path(temp_prefix, ".truncated")
             if not temp_single.exists():
                 logger.error("AdapterRemoval 出力が見つかりません: %s", temp_single)
                 return None
@@ -110,9 +114,9 @@ class BWAMapper:
         rg_string: str,
         sample_acc: str,
     ) -> Optional[Path]:
-        collapsed_file = temp_prefix.with_suffix(".collapsed.truncated")
-        r1_file = temp_prefix.with_suffix(".pair1.truncated")
-        r2_file = temp_prefix.with_suffix(".pair2.truncated")
+        collapsed_file = self._adapter_output_path(temp_prefix, ".collapsed.truncated")
+        r1_file = self._adapter_output_path(temp_prefix, ".pair1.truncated")
+        r2_file = self._adapter_output_path(temp_prefix, ".pair2.truncated")
         partial_bams: List[Path] = []
 
         if collapsed_file.exists():
@@ -156,8 +160,8 @@ class BWAMapper:
         rg_string: str,
         sample_acc: str,
     ) -> Optional[Path]:
-        temp_r1 = temp_prefix.with_suffix(".pair1.truncated")
-        temp_r2 = temp_prefix.with_suffix(".pair2.truncated")
+        temp_r1 = self._adapter_output_path(temp_prefix, ".pair1.truncated")
+        temp_r2 = self._adapter_output_path(temp_prefix, ".pair2.truncated")
         if not (temp_r1.exists() and temp_r2.exists()):
             logger.error("AdapterRemoval 出力が見つかりません: %s / %s", sample_acc, run_id)
             return None

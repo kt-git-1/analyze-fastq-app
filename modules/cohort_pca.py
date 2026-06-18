@@ -136,6 +136,10 @@ def extract_pseudohaploid_calls(
     """Extract one high-quality allele per sample/site from final dedup BAMs."""
     import pysam
 
+    sites_by_chrom: Dict[str, List[Tuple[int, PCASite]]] = {}
+    for idx, site in enumerate(sites):
+        sites_by_chrom.setdefault(site.chrom, []).append((idx, site))
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -145,28 +149,33 @@ def extract_pseudohaploid_calls(
                 logger.warning("PCA allele extraction skipped missing BAM: %s (%s)", sample, bam_path)
                 continue
             logger.info("pseudo-haploid allele を抽出します: %s", sample)
+            calls_by_site: Dict[int, Tuple[str, int, int]] = {}
             with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-                for site in sites:
-                    allele = ""
-                    baseq = 0
-                    mapq = 0
+                references = set(bam.references)
+                for chrom, chrom_sites in sites_by_chrom.items():
+                    if chrom not in references:
+                        logger.warning("PCA sites contig is absent from BAM header: %s (%s)", chrom, sample)
+                        continue
+                    positions = {}
+                    for idx, site in chrom_sites:
+                        positions.setdefault(site.pos - 1, []).append((idx, site))
+                    start = min(positions)
+                    stop = max(positions) + 1
                     for column in bam.pileup(
-                        site.chrom,
-                        site.pos - 1,
-                        site.pos,
+                        chrom,
+                        start,
+                        stop,
                         truncate=True,
                         stepper="samtools",
                         min_mapping_quality=min_mapq,
                     ):
-                        if column.reference_pos != site.pos - 1:
+                        target_sites = positions.get(column.reference_pos)
+                        if not target_sites:
                             continue
-                        allele, baseq, mapq = _choose_pileup_allele(
-                            column,
-                            site,
-                            min_baseq,
-                            trim_ends,
-                        )
-                        break
+                        for idx, site in target_sites:
+                            calls_by_site[idx] = _choose_pileup_allele(column, site, min_baseq, trim_ends)
+                for idx, site in enumerate(sites):
+                    allele, baseq, mapq = calls_by_site.get(idx, ("", 0, 0))
                     writer.writerow([sample, site.site_id, site.chrom, site.pos, site.ref, site.alt, allele, baseq, mapq])
     return out_path
 
@@ -450,7 +459,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         write_sites_table(sites, sites_table)
 
     sample_bams = {
-        sample: config.results_dir / sample / "dedup" / "%s.dedup.sorted.bam" % sample
+        sample: config.results_dir / sample / "dedup" / ("%s.dedup.sorted.bam" % sample)
         for sample in sample_list
     }
 

@@ -33,6 +33,18 @@ def test_bwa_pe_command_includes_threads_reference_and_read_group(monkeypatch, m
     assert captured["cmd"][-2:] == ["r1.fq.gz", "r2.fq.gz"]
 
 
+def test_adapter_output_path_preserves_dots_in_run_id(make_config):
+    mapper = BWAMapper(make_config())
+    prefix = Path("temp") / "S1" / "BER01_A__BER01_A_E16.1_user_TGTCTG__RUN"
+
+    assert mapper._adapter_output_path(prefix, ".truncated") == Path(
+        "temp/S1/BER01_A__BER01_A_E16.1_user_TGTCTG__RUN.truncated"
+    )
+    assert mapper._adapter_output_path(prefix, ".pair1.truncated") == Path(
+        "temp/S1/BER01_A__BER01_A_E16.1_user_TGTCTG__RUN.pair1.truncated"
+    )
+
+
 def test_run_mapping_pipeline_modern_pe_requires_adapter_outputs(monkeypatch, make_config, tmp_path):
     cfg = make_config(data_type="modern")
     mapper = BWAMapper(cfg)
@@ -46,8 +58,8 @@ def test_run_mapping_pipeline_modern_pe_moves_outputs_and_maps(monkeypatch, make
     mapper = BWAMapper(cfg)
     monkeypatch.setattr(mapper, "_run_streaming", lambda cmd, step_name: None)
     temp_prefix = cfg.temp_dir / "S1" / "RUN1"
-    touch(temp_prefix.with_suffix(".pair1.truncated"))
-    touch(temp_prefix.with_suffix(".pair2.truncated"))
+    touch(mapper._adapter_output_path(temp_prefix, ".pair1.truncated"))
+    touch(mapper._adapter_output_path(temp_prefix, ".pair2.truncated"))
     captured = {}
     monkeypatch.setattr(
         mapper,
@@ -64,16 +76,16 @@ def test_run_mapping_pipeline_modern_pe_moves_outputs_and_maps(monkeypatch, make
 def test_ancient_pe_maps_available_outputs_and_merges(monkeypatch, make_config, tmp_path):
     cfg = make_config()
     mapper = BWAMapper(cfg)
-    prefix = tmp_path / "temp" / "RUN1"
+    prefix = tmp_path / "temp" / "RUN1.1_user_TAG"
     bam_dir = tmp_path / "bam"
     bam_dir.mkdir()
-    touch(prefix.with_suffix(".collapsed.truncated"))
-    touch(prefix.with_suffix(".pair1.truncated"))
-    touch(prefix.with_suffix(".pair2.truncated"))
+    touch(mapper._adapter_output_path(prefix, ".collapsed.truncated"))
+    touch(mapper._adapter_output_path(prefix, ".pair1.truncated"))
+    touch(mapper._adapter_output_path(prefix, ".pair2.truncated"))
     calls = []
     monkeypatch.setattr(mapper, "_run_bwa_se_and_sort", lambda fastq, out, rg, label: calls.append(("se", fastq)) or touch(out))
     monkeypatch.setattr(mapper, "_run_bwa_pe_and_sort", lambda r1, r2, out, rg, label: calls.append(("pe", r1, r2)) or touch(out))
     monkeypatch.setattr(mapper, "_merge_bams", lambda bams, merged: calls.append(("merge", tuple(bams), merged)) or True)
 
-    assert mapper._map_ancient_pe(prefix, bam_dir, "RUN1", "rg", "S1") == bam_dir / "RUN1.merged.sorted.bam"
+    assert mapper._map_ancient_pe(prefix, bam_dir, "RUN1.1_user_TAG", "rg", "S1") == bam_dir / "RUN1.1_user_TAG.merged.sorted.bam"
     assert [call[0] for call in calls] == ["se", "pe", "merge"]
