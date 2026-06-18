@@ -284,3 +284,9 @@ def test_analysis_dashboard_renders_human_readable_status(monkeypatch):
     assert "解析完了" in text
     assert "root:" not in text
     assert "__main__:" not in text
+
+
+def test_dashboard_screen_line_count_accounts_for_wrapped_and_wide_text():
+    text = "解析パイプライン: ancient\n" + ("A" * 25)
+
+    assert main_module._screen_line_count(text, 10) == 6

@@ -6,6 +6,7 @@ import threading
 import time
 import re
 import csv
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -236,6 +237,21 @@ def _shorten_middle(text: str, width: int) -> str:
     return text[:left] + "..." + text[-right:]
 
 
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return width
+
+
+def _screen_line_count(text: str, terminal_width: int) -> int:
+    terminal_width = max(1, terminal_width)
+    rows = 0
+    for line in text.splitlines() or [""]:
+        rows += max(1, (_display_width(line) + terminal_width - 1) // terminal_width)
+    return rows
+
+
 def _progress_bar(done: int, total: int, width: int = 30) -> str:
     if total <= 0:
         return "[" + "-" * width + "]"
@@ -408,11 +424,12 @@ class AnalysisDashboard:
         if not force and now - self._last_rendered_at < 0.2:
             return
         text = self._render_text_unlocked()
+        terminal_width = shutil.get_terminal_size((100, 20)).columns
         if self._rendered_lines:
-            sys.stderr.write("\033[%dF\033[J" % self._rendered_lines)
+            sys.stderr.write("\r\033[%dA\033[J" % self._rendered_lines)
         sys.stderr.write(text + "\n")
         sys.stderr.flush()
-        self._rendered_lines = text.count("\n") + 1
+        self._rendered_lines = _screen_line_count(text, terminal_width)
         self._last_rendered_at = now
 
     def close(self) -> None:
