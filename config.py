@@ -8,8 +8,9 @@ from typing import List, Optional, Union
 
 from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+from tool_paths import CONVERTF_BIN, PICARD_JAR, PLINK_BIN, SMARTPCA_BIN
 
+logger = logging.getLogger(__name__)
 
 class PipelineConfig:
     """
@@ -59,14 +60,13 @@ class PipelineConfig:
             "java", "gatk", "qualimap", "mapDamage",
         ]
         if getattr(self.args, "run_pca", False) and getattr(self.args, "pca_engine", "eigensoft") == "eigensoft":
-            required_tools.extend(["plink", "convertf", "smartpca"])
+            required_tools.extend([str(PLINK_BIN), str(CONVERTF_BIN), str(SMARTPCA_BIN)])
         for tool in required_tools:
             if not shutil.which(tool):
                 errors.append(f"外部ツールが見つかりません: {tool}")
 
-        picard_jar: Path = Path(self.args.picard_jar)
-        if not picard_jar.exists():
-            errors.append(f"Picard jar が見つかりません: {picard_jar}")
+        if not PICARD_JAR.exists():
+            errors.append(f"Picard jar が見つかりません: {PICARD_JAR}")
 
         bwa_index_suffixes = [".amb", ".ann", ".bwt", ".pac", ".sa"]
         missing_idx = [
@@ -209,13 +209,6 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="完了済みサンプルのチェックポイント (.done) を無視して全サンプルを再実行する",
-    )
-    # Picard jar パス
-    parser.add_argument(
-        "--picard_jar",
-        type=Path,
-        default=Path("/usr/local/bin/picard.jar"),
-        help="Picard jar ファイルのパス (デフォルト: /usr/local/bin/picard.jar)",
     )
     # リードグループ: ライブラリ名
     parser.add_argument(

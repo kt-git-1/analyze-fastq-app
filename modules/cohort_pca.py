@@ -8,8 +8,9 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from tool_paths import CONVERTF_BIN, PLINK_BIN, SMARTPCA_BIN
 
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class PCASite:
@@ -892,7 +893,7 @@ def run_eigensoft_pca(
     if _stages_done(bed_files, force):
         logger.info("再開: 既存PLINK binary出力を使用します: %s", bed_prefix)
     else:
-        _run_command(["plink", "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
+        _run_command([str(PLINK_BIN), "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
 
     qc_files = [Path(str(qc_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
     if _stages_done(qc_files, force):
@@ -900,7 +901,7 @@ def run_eigensoft_pca(
     else:
         _run_command(
             [
-                "plink",
+                str(PLINK_BIN),
                 "--bfile",
                 str(bed_prefix),
                 "--mind",
@@ -921,7 +922,7 @@ def run_eigensoft_pca(
     else:
         _run_command(
             [
-                "plink",
+                str(PLINK_BIN),
                 "--bfile",
                 str(qc_prefix),
                 "--indep-pairwise",
@@ -939,7 +940,7 @@ def run_eigensoft_pca(
     else:
         _run_command(
             [
-                "plink",
+                str(PLINK_BIN),
                 "--bfile",
                 str(qc_prefix),
                 "--extract",
@@ -970,7 +971,7 @@ def run_eigensoft_pca(
     if _stages_done([geno_path, snp_path, ind_path], force):
         logger.info("再開: 既存EIGENSTRAT出力を使用します: %s", eigenstrat_dir)
     else:
-        _run_command(["convertf", "-p", str(convertf_par)])
+        _run_command([str(CONVERTF_BIN), "-p", str(convertf_par)])
 
     pca_dir.mkdir(parents=True, exist_ok=True)
     evec_path = pca_dir / "cohort.evec"
@@ -989,7 +990,7 @@ def run_eigensoft_pca(
     if _stages_done([evec_path, eval_path], force):
         logger.info("再開: 既存smartpca出力を使用します: %s", pca_dir)
     else:
-        _run_command(["smartpca", "-p", str(smartpca_par)])
+        _run_command([str(SMARTPCA_BIN), "-p", str(smartpca_par)])
 
     pca_scores = pca_dir / "pca_scores.tsv"
     if _stage_done(pca_scores, force):

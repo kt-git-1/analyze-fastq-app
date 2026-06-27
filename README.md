@@ -41,6 +41,14 @@ python main.py \
 
 ### PCA/MDS まで実行
 
+PCA/MDS で `--pca-engine eigensoft` を使う場合、外部ツールは次の固定パスから実行します。conda activate は不要です。
+
+```sh
+ls -l /usr/local/bin/plink
+ls -l /usr/bin/convertf
+ls -l /usr/bin/smartpca
+```
+
 ```sh
 python main.py \
   --fastq_dir ./my_fastqs \
@@ -327,6 +335,9 @@ VCF は sample ごとに出力されます。複数の run / lane / FASTQ が同
 
 `--run-pca --pca-sites <sites.vcf>` を指定すると、全 sample 完了後に cohort PCA/MDS stage を実行します。`--data_type ancient` では保持された final dedup BAM から指定SNP座位の allele を抽出して pseudo-haploid matrix を作成します。`--data_type modern` では保持された final dedup BAM から指定SNP座位の ref/alt read count を取り、0/1/2 の diploid genotype matrix を作成します。`--data_type auto` では final dedup BAM のmapped read length中央値を集計し、cohort中央値が100bp以下なら `ancient`、100bp超なら `modern` としてPCA入力を自動分岐します。推定結果は `cohort/auto_data_type_summary.tsv` と `pca_qc_summary.tsv` に出力されます。その後、PLINK QC / LD pruning、CONVERTF、smartpca の順に実行します。途中成果物が存在する場合は再利用され、`--force` 指定時のみ作り直します。外部ツールを使わず従来のPython内蔵PCA/MDSで確認したい場合は `--pca-engine python` を指定します。
 
+`--pca-engine eigensoft` は `/usr/local/bin/plink`、`/usr/bin/convertf`、`/usr/bin/smartpca` を直接呼び出します。これらが存在すれば、`conda activate ancient-pca` は不要です。
+固定パスは `tool_paths.py` で管理しています。別サーバーでパスが違う場合は、このファイルの `PLINK_BIN`、`CONVERTF_BIN`、`SMARTPCA_BIN`、`PICARD_JAR` を変更してください。
+
 資料の手順に沿ってQC閾値を指定する例:
 
 ```sh
@@ -405,7 +416,6 @@ BAM 入力モードでも同じ仕組みで `.done` を使います。
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size | `5` |
 | `--pca-ld-r2` | PLINK `--indep-pairwise` のr^2閾値 | `0.2` |
 | `--java_mem` | Picard など Java ツール用メモリ | `10g` |
-| `--picard_jar` | Picard jar のパス | `/usr/local/bin/picard.jar` |
 | `--rg_library` | BWA read group の library (`LB`) | `unknown` |
 | `--rg_center` | BWA read group の center (`CN`) | `unknown` |
 | `--force` | `.done` を無視して再実行する | `False` |

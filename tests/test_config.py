@@ -16,7 +16,6 @@ def make_args(tmp_path, **overrides):
         project_accession="PRJ",
         reference_genome=None,
         data_type="ancient",
-        picard_jar=tmp_path / "picard.jar",
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -133,9 +132,11 @@ def test_parse_args_accepts_data_type_auto(monkeypatch, tmp_path):
 
 def test_validate_environment_reports_missing_items(monkeypatch, tmp_path):
     ref = touch(tmp_path / "ref.fa")
-    args = make_args(tmp_path, reference_genome=ref, picard_jar=tmp_path / "missing.jar")
+    missing_picard = tmp_path / "missing.jar"
+    args = make_args(tmp_path, reference_genome=ref)
     cfg = PipelineConfig(args)
     monkeypatch.setattr(config_module.shutil, "which", lambda tool: None)
+    monkeypatch.setattr(config_module, "PICARD_JAR", missing_picard)
 
     with pytest.raises(SystemExit):
         cfg.validate_environment()
@@ -150,7 +151,7 @@ def test_validate_environment_requires_eigensoft_tools_only_for_eigensoft(monkey
 
     def fake_which(tool):
         seen.append(tool)
-        if tool in {"plink", "convertf", "smartpca"}:
+        if tool in {str(config_module.PLINK_BIN), str(config_module.CONVERTF_BIN), str(config_module.SMARTPCA_BIN)}:
             return None
         return f"/bin/{tool}"
 
@@ -158,12 +159,12 @@ def test_validate_environment_requires_eigensoft_tools_only_for_eigensoft(monkey
         make_args(
             tmp_path,
             reference_genome=ref,
-            picard_jar=picard,
             run_pca=True,
             pca_engine="python",
         )
     )
     monkeypatch.setattr(config_module.shutil, "which", fake_which)
+    monkeypatch.setattr(config_module, "PICARD_JAR", picard)
     cfg.validate_environment()
     assert "plink" not in seen
 
@@ -171,7 +172,6 @@ def test_validate_environment_requires_eigensoft_tools_only_for_eigensoft(monkey
         make_args(
             tmp_path,
             reference_genome=ref,
-            picard_jar=picard,
             run_pca=True,
             pca_engine="eigensoft",
         )
@@ -179,7 +179,7 @@ def test_validate_environment_requires_eigensoft_tools_only_for_eigensoft(monkey
     seen.clear()
     with pytest.raises(SystemExit):
         cfg.validate_environment()
-    assert {"plink", "convertf", "smartpca"}.issubset(set(seen))
+    assert {str(config_module.PLINK_BIN), str(config_module.CONVERTF_BIN), str(config_module.SMARTPCA_BIN)}.issubset(set(seen))
 
 
 def test_validate_environment_succeeds_when_tools_and_indexes_exist(monkeypatch, tmp_path):
@@ -187,7 +187,8 @@ def test_validate_environment_succeeds_when_tools_and_indexes_exist(monkeypatch,
     for suffix in (".amb", ".ann", ".bwt", ".pac", ".sa"):
         touch(tmp_path / ("ref.fa" + suffix))
     picard = touch(tmp_path / "picard.jar")
-    cfg = PipelineConfig(make_args(tmp_path, reference_genome=ref, picard_jar=picard))
+    cfg = PipelineConfig(make_args(tmp_path, reference_genome=ref))
     monkeypatch.setattr(config_module.shutil, "which", lambda tool: f"/bin/{tool}")
+    monkeypatch.setattr(config_module, "PICARD_JAR", picard)
 
     cfg.validate_environment()

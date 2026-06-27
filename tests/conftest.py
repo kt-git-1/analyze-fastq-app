@@ -11,7 +11,6 @@ def make_config(tmp_path):
             threads=4,
             workers=2,
             java_mem="2g",
-            picard_jar=tmp_path / "picard.jar",
             rg_library="lib",
             rg_center="center",
             force=False,

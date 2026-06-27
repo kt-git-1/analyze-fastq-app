@@ -156,11 +156,11 @@ def test_eigensoft_pipeline_writes_commands_and_parfiles(monkeypatch, tmp_path):
 
     def fake_run(cmd, cwd=None):
         commands.append(cmd)
-        if cmd[0] == "plink" and "--indep-pairwise" in cmd:
+        if cmd[0].endswith("plink") and "--indep-pairwise" in cmd:
             prune_prefix = Path(cmd[cmd.index("--out") + 1])
             prune_prefix.parent.mkdir(parents=True, exist_ok=True)
             Path(str(prune_prefix) + ".prune.in").write_text("rs1\nrs2\n")
-        if cmd[0] == "smartpca":
+        if cmd[0].endswith("smartpca"):
             pca_dir = tmp_path / "cohort" / "pca"
             pca_dir.mkdir(parents=True, exist_ok=True)
             (pca_dir / "cohort.evec").write_text("#eigvals: 2 1\nS1 0.1 0.2 Unknown\nS2 -0.1 0.0 Unknown\n")
@@ -175,14 +175,14 @@ def test_eigensoft_pipeline_writes_commands_and_parfiles(monkeypatch, tmp_path):
         cohort_pca.PCAQCConfig(max_sample_missing=0.8, max_site_missing=0.7, min_maf=0.1),
     )
 
-    assert commands[0][:3] == ["plink", "--tfile", str(tmp_path / "cohort" / "plink" / "cohort")]
+    assert commands[0][:3] == [str(cohort_pca.PLINK_BIN), "--tfile", str(tmp_path / "cohort" / "plink" / "cohort")]
     assert commands[1][commands[1].index("--mind") + 1] == "0.8"
     assert commands[1][commands[1].index("--geno") + 1] == "0.7"
     assert commands[1][commands[1].index("--maf") + 1] == "0.1"
-    assert commands[2][0] == "plink"
-    assert commands[3][0] == "plink"
-    assert commands[4][0] == "convertf"
-    assert commands[5][0] == "smartpca"
+    assert commands[2][0] == str(cohort_pca.PLINK_BIN)
+    assert commands[3][0] == str(cohort_pca.PLINK_BIN)
+    assert commands[4][0] == str(cohort_pca.CONVERTF_BIN)
+    assert commands[5][0] == str(cohort_pca.SMARTPCA_BIN)
     assert "genotypename:" in (tmp_path / "cohort" / "eigensoft" / "convertf.par").read_text()
     assert "evecoutname:" in (tmp_path / "cohort" / "eigensoft" / "smartpca.par").read_text()
     assert scores.read_text().splitlines()[0] == "sample\tPC1\tPC2"

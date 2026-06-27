@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from modules.logging_utils import log_command_start, log_tool_output
+from tool_paths import PICARD_JAR
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,9 @@ class BAMProcessor:
         run_bam_dir.mkdir(parents=True, exist_ok=True)
 
         clean_bam = run_bam_dir / f"{run_id}.clean.bam"
-        picard_jar = str(self.config.args.picard_jar)
-
         self._run_cmd(
             [
-                "java", "-Xmx" + self.config.args.java_mem, "-jar", picard_jar,
+                "java", "-Xmx" + self.config.args.java_mem, "-jar", str(PICARD_JAR),
                 "CleanSam",
                 "I=" + str(softclipped_bam),
                 "O=" + str(clean_bam),
@@ -69,8 +68,6 @@ class BAMProcessor:
         sample_dedup_dir = self.config.results_dir / sample_acc / "dedup"
         sample_dedup_dir.mkdir(parents=True, exist_ok=True)
 
-        picard_jar = str(self.config.args.picard_jar)
-
         # --- merge ---
         merged_bam = sample_dedup_dir / f"{sample_acc}.merged.bam"
         valid_bams = [str(b) for b in run_bams if b is not None and b.exists()]
@@ -92,7 +89,7 @@ class BAMProcessor:
         metrics_file = sample_dedup_dir / f"{sample_acc}.marked_dup_metrics.txt"
         self._run_cmd(
             [
-                "java", "-Xmx" + self.config.args.java_mem, "-jar", picard_jar,
+                "java", "-Xmx" + self.config.args.java_mem, "-jar", str(PICARD_JAR),
                 "MarkDuplicates",
                 "I=" + str(merged_bam),
                 "O=" + str(marked_bam),
