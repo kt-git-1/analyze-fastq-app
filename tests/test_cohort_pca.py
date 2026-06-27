@@ -193,6 +193,55 @@ def test_eigensoft_pipeline_writes_commands_and_parfiles(monkeypatch, tmp_path):
     assert plink_files[0].name == "cohort.tped"
 
 
+def test_eigensoft_pipeline_resumes_existing_outputs(monkeypatch, tmp_path):
+    cohort_dir = tmp_path / "cohort"
+    matrix = tmp_path / "filtered.tsv"
+    matrix.write_text("sample\trs1\trs2\nS1\t0\t1\nS2\t1\t0\n")
+    sites = [
+        cohort_pca.PCASite("chr1", 10, "rs1", "A", "G"),
+        cohort_pca.PCASite("chr1", 20, "rs2", "C", "T"),
+    ]
+    for path in (
+        cohort_dir / "plink" / "cohort.tped",
+        cohort_dir / "plink" / "cohort.tfam",
+        cohort_dir / "plink" / "cohort.bed",
+        cohort_dir / "plink" / "cohort.bim",
+        cohort_dir / "plink" / "cohort.fam",
+        cohort_dir / "plink" / "cohort.qc.bed",
+        cohort_dir / "plink" / "cohort.qc.bim",
+        cohort_dir / "plink" / "cohort.qc.fam",
+        cohort_dir / "plink" / "cohort.prune.prune.in",
+        cohort_dir / "plink" / "cohort.pruned.bed",
+        cohort_dir / "plink" / "cohort.pruned.bim",
+        cohort_dir / "plink" / "cohort.pruned.fam",
+        cohort_dir / "eigenstrat" / "cohort.geno",
+        cohort_dir / "eigenstrat" / "cohort.snp",
+        cohort_dir / "eigenstrat" / "cohort.ind",
+        cohort_dir / "pca" / "cohort.evec",
+        cohort_dir / "pca" / "cohort.eval",
+        cohort_dir / "pca" / "pca_scores.tsv",
+        cohort_dir / "pca" / "pca_variance.tsv",
+        cohort_dir / "pca" / "mds.tsv",
+    ):
+        touch(path)
+    (cohort_dir / "plink" / "cohort.prune.prune.in").write_text("rs1\nrs2\n")
+    commands = []
+    monkeypatch.setattr(cohort_pca, "_run_command", lambda cmd, cwd=None: commands.append(cmd))
+
+    _eigenstrat, _plink, scores, variance, mds, pruned = cohort_pca.run_eigensoft_pca(
+        matrix,
+        sites,
+        cohort_dir,
+        cohort_pca.PCAQCConfig(),
+    )
+
+    assert commands == []
+    assert scores == cohort_dir / "pca" / "pca_scores.tsv"
+    assert variance == cohort_dir / "pca" / "pca_variance.tsv"
+    assert mds == cohort_dir / "pca" / "mds.tsv"
+    assert pruned == 2
+
+
 def test_run_cohort_pca_modern_uses_diploid_bam_calls(monkeypatch, make_config, tmp_path):
     cfg = make_config(data_type="modern")
     cfg.args.pca_sites = tmp_path / "sites.vcf"

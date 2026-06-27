@@ -54,6 +54,10 @@ def _stage_done(path: Path, force: bool) -> bool:
     return (not force) and _is_nonempty_file(path)
 
 
+def _stages_done(paths: Iterable[Path], force: bool) -> bool:
+    return (not force) and all(_is_nonempty_file(path) for path in paths)
+
+
 def _run_command(cmd: List[str], *, cwd: Optional[Path] = None) -> None:
     logger.info("外部コマンドを実行します: %s", " ".join(cmd))
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
@@ -96,12 +100,29 @@ def _median_mapped_read_length(bam_path: Path, max_reads: int = 20000) -> Option
     return float(statistics.median(lengths))
 
 
-def infer_pca_data_type(config, samples: Iterable[str], cohort_dir: Path) -> str:
+def _read_auto_inferred_type(summary: Path) -> Optional[str]:
+    if not _is_nonempty_file(summary):
+        return None
+    with summary.open(errors="replace") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        for row in reader:
+            if len(row) >= 2 and row[0] == "inferred_data_type" and row[1] in {"ancient", "modern"}:
+                return row[1]
+    return None
+
+
+def infer_pca_data_type(config, samples: Iterable[str], cohort_dir: Path, *, force: bool = False) -> str:
     requested = config.data_type
     if requested in {"ancient", "modern"}:
         return requested
     if requested != "auto":
         raise NotImplementedError("PCA stage supports data_type=ancient, modern, or auto")
+
+    summary = cohort_dir / "auto_data_type_summary.tsv"
+    existing = None if force else _read_auto_inferred_type(summary)
+    if existing:
+        logger.info("再開: 既存auto data_type推定を使用します: %s (%s)", existing, summary)
+        return existing
 
     rows: List[Tuple[str, str, str]] = []
     medians: List[float] = []
@@ -123,7 +144,6 @@ def infer_pca_data_type(config, samples: Iterable[str], cohort_dir: Path) -> str
 
     cohort_median = float(statistics.median(medians))
     inferred = "ancient" if cohort_median <= 100.0 else "modern"
-    summary = cohort_dir / "auto_data_type_summary.tsv"
     summary.parent.mkdir(parents=True, exist_ok=True)
     with summary.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -500,6 +520,56 @@ def _filter_matrix(
     sites: Optional[List[PCASite]],
     ploidy: int,
 ) -> MatrixStats:
+    matrix_stats, kept_rows, kept_site_ids, data = _filter_matrix_components(
+        matrix_path,
+        max_site_missing,
+        max_sample_missing,
+        min_maf,
+        exclude_sex_chr,
+        sites,
+        ploidy,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample"] + kept_site_ids)
+        for row, values in zip(kept_rows, data):
+            writer.writerow([row[0]] + ["" if np.isnan(value) else str(int(value)) for value in values])
+
+    return matrix_stats
+
+
+def _filter_matrix_stats(
+    matrix_path: Path,
+    max_site_missing: float,
+    max_sample_missing: float,
+    min_maf: float,
+    exclude_sex_chr: bool,
+    sites: Optional[List[PCASite]],
+    ploidy: int,
+) -> MatrixStats:
+    matrix_stats, _kept_rows, _kept_site_ids, _data = _filter_matrix_components(
+        matrix_path,
+        max_site_missing,
+        max_sample_missing,
+        min_maf,
+        exclude_sex_chr,
+        sites,
+        ploidy,
+    )
+    return matrix_stats
+
+
+def _filter_matrix_components(
+    matrix_path: Path,
+    max_site_missing: float,
+    max_sample_missing: float,
+    min_maf: float,
+    exclude_sex_chr: bool,
+    sites: Optional[List[PCASite]],
+    ploidy: int,
+) -> Tuple[MatrixStats, List[List[str]], List[str], np.ndarray]:
     with matrix_path.open(errors="replace") as handle:
         reader = csv.reader(handle, delimiter="\t")
         header = next(reader)
@@ -547,14 +617,7 @@ def _filter_matrix(
     if data.size == 0 or not kept_site_ids:
         raise ValueError("No variable SNP sites remain after PCA filtering")
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", newline="") as handle:
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["sample"] + kept_site_ids)
-        for row, values in zip(kept_rows, data):
-            writer.writerow([row[0]] + ["" if np.isnan(value) else str(int(value)) for value in values])
-
-    return MatrixStats(
+    matrix_stats = MatrixStats(
         input_samples=len(rows),
         input_sites=len(header) - 1,
         kept_samples=len(kept_rows),
@@ -564,6 +627,7 @@ def _filter_matrix(
         maf_removed_sites=int(np.sum(missing_keep & variable_keep & ~maf_keep_array)),
         sex_chr_removed_sites=int(np.sum(missing_keep & variable_keep & maf_keep_array & ~sex_chr_keep_array)),
     )
+    return matrix_stats, kept_rows, kept_site_ids, data
 
 
 def _load_numeric_matrix(matrix_path: Path) -> Tuple[List[str], List[str], np.ndarray]:
@@ -804,61 +868,87 @@ def run_eigensoft_pca(
     qc: PCAQCConfig,
     *,
     pseudo_haploid: bool = False,
+    force: bool = False,
 ) -> Tuple[Tuple[Path, Path, Path], Tuple[Path, Path], Path, Path, Path, int]:
     plink_dir = cohort_dir / "plink"
     eigenstrat_dir = cohort_dir / "eigenstrat"
     pca_dir = cohort_dir / "pca"
     par_dir = cohort_dir / "eigensoft"
 
-    plink_files = export_plink_text(filtered_matrix, sites, plink_dir, pseudo_haploid=pseudo_haploid)
+    tped_path = plink_dir / "cohort.tped"
+    tfam_path = plink_dir / "cohort.tfam"
+    if _stages_done([tped_path, tfam_path], force):
+        logger.info("再開: 既存PLINK text出力を使用します: %s", plink_dir)
+        plink_files = (tped_path, tfam_path)
+    else:
+        plink_files = export_plink_text(filtered_matrix, sites, plink_dir, pseudo_haploid=pseudo_haploid)
     tfile_prefix = plink_dir / "cohort"
     bed_prefix = plink_dir / "cohort"
     qc_prefix = plink_dir / "cohort.qc"
     prune_prefix = plink_dir / "cohort.prune"
     pruned_prefix = plink_dir / "cohort.pruned"
 
-    _run_command(["plink", "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
-    _run_command(
-        [
-            "plink",
-            "--bfile",
-            str(bed_prefix),
-            "--mind",
-            str(qc.max_sample_missing),
-            "--geno",
-            str(qc.max_site_missing),
-            "--maf",
-            str(qc.min_maf),
-            "--make-bed",
-            "--out",
-            str(qc_prefix),
-        ]
-    )
-    _run_command(
-        [
-            "plink",
-            "--bfile",
-            str(qc_prefix),
-            "--indep-pairwise",
-            str(qc.ld_window),
-            str(qc.ld_step),
-            str(qc.ld_r2),
-            "--out",
-            str(prune_prefix),
-        ]
-    )
-    _run_command(
-        [
-            "plink",
-            "--bfile",
-            str(qc_prefix),
-            "--extract",
-            str(prune_prefix) + ".prune.in",
-            "--make-bed",
-            "--out",
-            str(pruned_prefix),
-        ]
-    )
+    bed_files = [Path(str(bed_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
+    if _stages_done(bed_files, force):
+        logger.info("再開: 既存PLINK binary出力を使用します: %s", bed_prefix)
+    else:
+        _run_command(["plink", "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
+
+    qc_files = [Path(str(qc_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
+    if _stages_done(qc_files, force):
+        logger.info("再開: 既存PLINK QC出力を使用します: %s", qc_prefix)
+    else:
+        _run_command(
+            [
+                "plink",
+                "--bfile",
+                str(bed_prefix),
+                "--mind",
+                str(qc.max_sample_missing),
+                "--geno",
+                str(qc.max_site_missing),
+                "--maf",
+                str(qc.min_maf),
+                "--make-bed",
+                "--out",
+                str(qc_prefix),
+            ]
+        )
+
+    prune_in = Path(str(prune_prefix) + ".prune.in")
+    if _stage_done(prune_in, force):
+        logger.info("再開: 既存PLINK LD pruningリストを使用します: %s", prune_in)
+    else:
+        _run_command(
+            [
+                "plink",
+                "--bfile",
+                str(qc_prefix),
+                "--indep-pairwise",
+                str(qc.ld_window),
+                str(qc.ld_step),
+                str(qc.ld_r2),
+                "--out",
+                str(prune_prefix),
+            ]
+        )
+
+    pruned_files = [Path(str(pruned_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
+    if _stages_done(pruned_files, force):
+        logger.info("再開: 既存PLINK LD pruned出力を使用します: %s", pruned_prefix)
+    else:
+        _run_command(
+            [
+                "plink",
+                "--bfile",
+                str(qc_prefix),
+                "--extract",
+                str(prune_in),
+                "--make-bed",
+                "--out",
+                str(pruned_prefix),
+            ]
+        )
 
     geno_path = eigenstrat_dir / "cohort.geno"
     snp_path = eigenstrat_dir / "cohort.snp"
@@ -877,7 +967,10 @@ def run_eigensoft_pca(
             "indivoutname": ind_path,
         },
     )
-    _run_command(["convertf", "-p", str(convertf_par)])
+    if _stages_done([geno_path, snp_path, ind_path], force):
+        logger.info("再開: 既存EIGENSTRAT出力を使用します: %s", eigenstrat_dir)
+    else:
+        _run_command(["convertf", "-p", str(convertf_par)])
 
     pca_dir.mkdir(parents=True, exist_ok=True)
     evec_path = pca_dir / "cohort.evec"
@@ -893,11 +986,26 @@ def run_eigensoft_pca(
             "numoutevec": 10,
         },
     )
-    _run_command(["smartpca", "-p", str(smartpca_par)])
+    if _stages_done([evec_path, eval_path], force):
+        logger.info("再開: 既存smartpca出力を使用します: %s", pca_dir)
+    else:
+        _run_command(["smartpca", "-p", str(smartpca_par)])
 
-    pca_scores = _convert_evec_to_tsv(evec_path, pca_dir / "pca_scores.tsv")
-    pca_variance = _convert_eval_to_tsv(eval_path, pca_dir / "pca_variance.tsv")
-    mds_path = write_mds_from_matrix(filtered_matrix, pca_dir / "mds.tsv")
+    pca_scores = pca_dir / "pca_scores.tsv"
+    if _stage_done(pca_scores, force):
+        logger.info("再開: 既存PCA score TSVを使用します: %s", pca_scores)
+    else:
+        pca_scores = _convert_evec_to_tsv(evec_path, pca_scores)
+    pca_variance = pca_dir / "pca_variance.tsv"
+    if _stage_done(pca_variance, force):
+        logger.info("再開: 既存PCA variance TSVを使用します: %s", pca_variance)
+    else:
+        pca_variance = _convert_eval_to_tsv(eval_path, pca_variance)
+    mds_path = pca_dir / "mds.tsv"
+    if _stage_done(mds_path, force):
+        logger.info("再開: 既存MDS TSVを使用します: %s", mds_path)
+    else:
+        mds_path = write_mds_from_matrix(filtered_matrix, mds_path)
 
     return (
         (geno_path, snp_path, ind_path),
@@ -905,7 +1013,7 @@ def run_eigensoft_pca(
         pca_scores,
         pca_variance,
         mds_path,
-        _count_pruned_snps(Path(str(prune_prefix) + ".prune.in")),
+        _count_pruned_snps(prune_in),
     )
 
 
@@ -974,7 +1082,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
     cohort_dir = config.results_dir / "cohort"
     pca_dir = cohort_dir / "pca"
     sites_table = cohort_dir / "pca_sites.tsv"
-    resolved_data_type = infer_pca_data_type(config, sample_list, cohort_dir)
+    resolved_data_type = infer_pca_data_type(config, sample_list, cohort_dir, force=force)
     if resolved_data_type == "ancient":
         raw_calls = cohort_dir / "pseudohaploid_raw_calls.tsv"
         matrix = cohort_dir / "pseudohaploid_matrix.tsv"
@@ -1039,16 +1147,28 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         else:
             logger.info("再開: 既存modern genotype matrixを使用します: %s", matrix)
 
-    matrix_stats = _filter_matrix(
-        matrix,
-        filtered_matrix,
-        qc.max_site_missing,
-        qc.max_sample_missing,
-        qc.min_maf,
-        qc.exclude_sex_chr,
-        sites,
-        ploidy,
-    )
+    if _stage_done(filtered_matrix, force):
+        logger.info("再開: 既存filtered matrixを使用します: %s", filtered_matrix)
+        matrix_stats = _filter_matrix_stats(
+            matrix,
+            qc.max_site_missing,
+            qc.max_sample_missing,
+            qc.min_maf,
+            qc.exclude_sex_chr,
+            sites,
+            ploidy,
+        )
+    else:
+        matrix_stats = _filter_matrix(
+            matrix,
+            filtered_matrix,
+            qc.max_site_missing,
+            qc.max_sample_missing,
+            qc.min_maf,
+            qc.exclude_sex_chr,
+            sites,
+            ploidy,
+        )
 
     ld_pruned_sites: Optional[int] = None
     if engine == "eigensoft":
@@ -1058,11 +1178,32 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             cohort_dir,
             qc,
             pseudo_haploid=pseudo_haploid,
+            force=force,
         )
     else:
-        eigenstrat_files = export_eigenstrat(filtered_matrix, sites, cohort_dir / "eigenstrat")
-        plink_files = export_plink_text(filtered_matrix, sites, cohort_dir / "plink", pseudo_haploid=pseudo_haploid)
-        pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
+        eigenstrat_dir = cohort_dir / "eigenstrat"
+        eigenstrat_files = (
+            eigenstrat_dir / "cohort.geno",
+            eigenstrat_dir / "cohort.snp",
+            eigenstrat_dir / "cohort.ind",
+        )
+        if _stages_done(eigenstrat_files, force):
+            logger.info("再開: 既存EIGENSTRAT互換出力を使用します: %s", eigenstrat_dir)
+        else:
+            eigenstrat_files = export_eigenstrat(filtered_matrix, sites, eigenstrat_dir)
+        plink_dir = cohort_dir / "plink"
+        plink_files = (plink_dir / "cohort.tped", plink_dir / "cohort.tfam")
+        if _stages_done(plink_files, force):
+            logger.info("再開: 既存PLINK text出力を使用します: %s", plink_dir)
+        else:
+            plink_files = export_plink_text(filtered_matrix, sites, plink_dir, pseudo_haploid=pseudo_haploid)
+        pca_scores = pca_dir / "pca_scores.tsv"
+        pca_variance = pca_dir / "pca_variance.tsv"
+        mds = pca_dir / "mds.tsv"
+        if _stages_done([pca_scores, pca_variance, mds], force):
+            logger.info("再開: 既存Python PCA/MDS出力を使用します: %s", pca_dir)
+        else:
+            pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
     qc_summary = _write_qc_summary(
         cohort_dir / "pca_qc_summary.tsv",
         sample_list,

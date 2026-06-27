@@ -357,6 +357,8 @@ python main.py \
 
 未完了 sample は、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は BWA mapping / Soft clipping / CleanSam / MarkDuplicates を再実行せず、QC / HaplotypeCaller 側へ進みます。`mapdamage/`、`qualimap/`、`vcf_files/<sample>.vcf` の既存出力がある場合も再利用します。
 
+PCA stage も途中成果物を再利用します。`pca_sites.tsv`、raw calls、matrix、filtered matrix、PLINK text/binary/QC/LD pruning、EIGENSTRAT、smartpca、`pca_scores.tsv`、`pca_variance.tsv`、`mds.tsv` が既に存在する場合は、`--force` を付けない限り既存出力を使って次の未完了ステップから再開します。
+
 FASTQ 解析では、run 単位の BAM や一時ファイルは sample ごとに即時削除せず、全 sample の処理が終わってから成功 sample 分だけまとめて削除します。失敗 sample の中間ファイルは原因調査と再開のため残します。最終 dedup BAM と index は後段解析用に保持します。
 
 全 sample を強制的に再実行する場合:
