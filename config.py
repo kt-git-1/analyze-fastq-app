@@ -58,6 +58,8 @@ class PipelineConfig:
             "bwa", "samtools", "AdapterRemoval",
             "java", "gatk", "qualimap", "mapDamage",
         ]
+        if getattr(self.args, "run_pca", False) and getattr(self.args, "pca_engine", "eigensoft") == "eigensoft":
+            required_tools.extend(["plink", "convertf", "smartpca"])
         for tool in required_tools:
             if not shutil.which(tool):
                 errors.append(f"外部ツールが見つかりません: {tool}")
@@ -199,8 +201,8 @@ def parse_args() -> argparse.Namespace:
         "--data_type",
         type=str,
         default="ancient",
-        help="データがmodernかancientか指定",
-        choices=["modern", "ancient"],
+        help="データがmodernかancientか指定。auto は解析後にPCA分岐を推定します",
+        choices=["modern", "ancient", "auto"],
     )
     # チェックポイントを無視して再実行
     parser.add_argument(
@@ -262,6 +264,71 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="PCA/MDSで比較する共通SNPリスト (VCF または BED-like text)",
     )
+    parser.add_argument(
+        "--pca-engine",
+        choices=["eigensoft", "python"],
+        default="eigensoft",
+        help="PCA実行エンジン。eigensoft は PLINK/CONVERTF/smartpca を使う (デフォルト: eigensoft)",
+    )
+    parser.add_argument(
+        "--pca-min-mapq",
+        type=int,
+        default=30,
+        help="pseudo-haploid抽出で使う最小mapping quality (デフォルト: 30)",
+    )
+    parser.add_argument(
+        "--pca-min-baseq",
+        type=int,
+        default=30,
+        help="pseudo-haploid抽出で使う最小base quality (デフォルト: 30)",
+    )
+    parser.add_argument(
+        "--pca-trim-ends",
+        type=int,
+        default=2,
+        help="pseudo-haploid抽出時にread両端から除外する塩基数 (デフォルト: 2)",
+    )
+    parser.add_argument(
+        "--pca-max-sample-missing",
+        type=float,
+        default=0.9,
+        help="PCA matrixで許容するsample欠損率の上限 (デフォルト: 0.9)",
+    )
+    parser.add_argument(
+        "--pca-max-site-missing",
+        type=float,
+        default=0.9,
+        help="PCA matrixで許容するSNP欠損率の上限 (デフォルト: 0.9)",
+    )
+    parser.add_argument(
+        "--pca-min-maf",
+        type=float,
+        default=0.0,
+        help="PCA matrixで残す最小minor allele frequency (デフォルト: 0.0)",
+    )
+    parser.add_argument(
+        "--pca-exclude-sex-chr",
+        action="store_true",
+        help="PCA matrixから性染色体SNPを除外する",
+    )
+    parser.add_argument(
+        "--pca-ld-window",
+        type=int,
+        default=50,
+        help="PLINK --indep-pairwise のwindow size (デフォルト: 50)",
+    )
+    parser.add_argument(
+        "--pca-ld-step",
+        type=int,
+        default=5,
+        help="PLINK --indep-pairwise のstep size (デフォルト: 5)",
+    )
+    parser.add_argument(
+        "--pca-ld-r2",
+        type=float,
+        default=0.2,
+        help="PLINK --indep-pairwise のr^2閾値 (デフォルト: 0.2)",
+    )
     args = parser.parse_args()
     if args.bam_dir and args.fastq_dir:
         parser.error("--bam_dir と --fastq_dir は同時に指定できません")
@@ -269,8 +336,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--bam_dir と --download-via-https は同時に指定できません")
     if args.run_pca and args.pca_sites is None:
         parser.error("--run-pca には --pca-sites が必要です")
-    if args.run_pca and args.data_type != "ancient":
-        parser.error("--run-pca は現在 --data_type ancient のみ対応しています")
+    for name in ("pca_max_sample_missing", "pca_max_site_missing", "pca_min_maf", "pca_ld_r2"):
+        value = getattr(args, name)
+        if value < 0 or value > 1:
+            parser.error("--%s は 0.0 から 1.0 の範囲で指定してください" % name.replace("_", "-"))
+    for name in ("pca_min_mapq", "pca_min_baseq", "pca_trim_ends", "pca_ld_window", "pca_ld_step"):
+        value = getattr(args, name)
+        if value < 0:
+            parser.error("--%s は 0 以上で指定してください" % name.replace("_", "-"))
+    if args.pca_ld_window == 0 or args.pca_ld_step == 0:
+        parser.error("--pca-ld-window と --pca-ld-step は 1 以上で指定してください")
     return args
 
 

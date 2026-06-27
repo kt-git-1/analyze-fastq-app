@@ -1,8 +1,10 @@
 import csv
 import logging
+import statistics
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -18,12 +20,128 @@ class PCASite:
     alt: str = ""
 
 
+@dataclass(frozen=True)
+class PCAQCConfig:
+    min_mapq: int = 30
+    min_baseq: int = 30
+    trim_ends: int = 2
+    max_sample_missing: float = 0.9
+    max_site_missing: float = 0.9
+    min_maf: float = 0.0
+    exclude_sex_chr: bool = False
+    ld_window: int = 50
+    ld_step: int = 5
+    ld_r2: float = 0.2
+
+
+@dataclass(frozen=True)
+class MatrixStats:
+    input_samples: int
+    input_sites: int
+    kept_samples: int
+    kept_sites: int
+    missingness_removed_sites: int
+    monomorphic_removed_sites: int
+    maf_removed_sites: int
+    sex_chr_removed_sites: int
+
+
 def _is_nonempty_file(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
 
 def _stage_done(path: Path, force: bool) -> bool:
     return (not force) and _is_nonempty_file(path)
+
+
+def _run_command(cmd: List[str], *, cwd: Optional[Path] = None) -> None:
+    logger.info("外部コマンドを実行します: %s", " ".join(cmd))
+    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+
+
+def _final_dedup_bam(config, sample: str) -> Path:
+    return config.results_dir / sample / "dedup" / ("%s.dedup.sorted.bam" % sample)
+
+
+def _pca_qc_from_args(args) -> PCAQCConfig:
+    return PCAQCConfig(
+        min_mapq=getattr(args, "pca_min_mapq", 30),
+        min_baseq=getattr(args, "pca_min_baseq", 30),
+        trim_ends=getattr(args, "pca_trim_ends", 2),
+        max_sample_missing=getattr(args, "pca_max_sample_missing", 0.9),
+        max_site_missing=getattr(args, "pca_max_site_missing", 0.9),
+        min_maf=getattr(args, "pca_min_maf", 0.0),
+        exclude_sex_chr=getattr(args, "pca_exclude_sex_chr", False),
+        ld_window=getattr(args, "pca_ld_window", 50),
+        ld_step=getattr(args, "pca_ld_step", 5),
+        ld_r2=getattr(args, "pca_ld_r2", 0.2),
+    )
+
+
+def _median_mapped_read_length(bam_path: Path, max_reads: int = 20000) -> Optional[float]:
+    if not _is_nonempty_file(bam_path):
+        return None
+    import pysam
+
+    lengths: List[int] = []
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for read in bam.fetch(until_eof=True):
+            if read.is_unmapped or read.query_length is None:
+                continue
+            lengths.append(read.query_length)
+            if len(lengths) >= max_reads:
+                break
+    if not lengths:
+        return None
+    return float(statistics.median(lengths))
+
+
+def infer_pca_data_type(config, samples: Iterable[str], cohort_dir: Path) -> str:
+    requested = config.data_type
+    if requested in {"ancient", "modern"}:
+        return requested
+    if requested != "auto":
+        raise NotImplementedError("PCA stage supports data_type=ancient, modern, or auto")
+
+    rows: List[Tuple[str, str, str]] = []
+    medians: List[float] = []
+    for sample in sorted(set(samples)):
+        bam_path = _final_dedup_bam(config, sample)
+        try:
+            median_len = _median_mapped_read_length(bam_path)
+        except Exception as exc:
+            logger.warning("auto data_type 推定でBAM read lengthを読めませんでした: %s (%s)", sample, exc)
+            median_len = None
+        if median_len is None:
+            rows.append([sample, "", "no_mapped_read_length"])
+        else:
+            medians.append(median_len)
+            rows.append([sample, "%.3f" % median_len, "ok"])
+
+    if not medians:
+        raise ValueError("data_type=auto ですが、final dedup BAMからread lengthを推定できません")
+
+    cohort_median = float(statistics.median(medians))
+    inferred = "ancient" if cohort_median <= 100.0 else "modern"
+    summary = cohort_dir / "auto_data_type_summary.tsv"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    with summary.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["metric", "value"])
+        writer.writerow(["requested_data_type", requested])
+        writer.writerow(["inferred_data_type", inferred])
+        writer.writerow(["cohort_median_read_length", "%.3f" % cohort_median])
+        writer.writerow(["read_length_cutoff", "100.000"])
+        writer.writerow([])
+        writer.writerow(["sample", "median_mapped_read_length", "status"])
+        writer.writerows(rows)
+    logger.info(
+        "data_type=auto: cohort median read length %.3f bp から %s と推定しました: %s",
+        cohort_median,
+        inferred,
+        summary,
+    )
+    return inferred
 
 
 def read_pca_sites(path: Path) -> List[PCASite]:
@@ -231,13 +349,157 @@ def build_pseudohaploid_matrix(
     return out_path
 
 
+def _count_pileup_alleles(
+    column,
+    site: PCASite,
+    min_baseq: int,
+    trim_ends: int,
+) -> Tuple[int, int, int]:
+    ref_count = 0
+    alt_count = 0
+    depth = 0
+    for pileup_read in column.pileups:
+        if pileup_read.is_del or pileup_read.is_refskip:
+            continue
+        read = pileup_read.alignment
+        qpos = pileup_read.query_position
+        if qpos is None or read.query_sequence is None:
+            continue
+        if trim_ends and (qpos < trim_ends or qpos >= read.query_length - trim_ends):
+            continue
+        baseq = read.query_qualities[qpos] if read.query_qualities is not None else 0
+        if baseq < min_baseq:
+            continue
+        base = read.query_sequence[qpos].upper()
+        if site.ref and base == site.ref:
+            ref_count += 1
+            depth += 1
+        elif site.alt and base == site.alt:
+            alt_count += 1
+            depth += 1
+    return ref_count, alt_count, depth
+
+
+def _diploid_dosage_from_counts(ref_count: int, alt_count: int, depth: int) -> str:
+    if depth <= 0:
+        return ""
+    alt_fraction = alt_count / depth
+    if alt_fraction <= 0.2:
+        return "0"
+    if alt_fraction >= 0.8:
+        return "2"
+    return "1"
+
+
+def extract_modern_diploid_calls(
+    sample_bams: Dict[str, Path],
+    sites: List[PCASite],
+    out_path: Path,
+    *,
+    min_mapq: int = 30,
+    min_baseq: int = 30,
+    trim_ends: int = 2,
+) -> Path:
+    """Extract diploid ref/alt dosage per sample/site from final dedup BAMs."""
+    import pysam
+
+    sites_by_chrom: Dict[str, List[Tuple[int, PCASite]]] = {}
+    for idx, site in enumerate(sites):
+        sites_by_chrom.setdefault(site.chrom, []).append((idx, site))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample", "site_id", "chrom", "pos", "ref", "alt", "ref_count", "alt_count", "depth", "dosage"])
+        for sample, bam_path in sorted(sample_bams.items()):
+            calls_by_site: Dict[int, Tuple[int, int, int, str]] = {}
+            if not _is_nonempty_file(bam_path):
+                logger.warning("modern PCA genotype extraction skipped missing BAM: %s (%s)", sample, bam_path)
+            else:
+                logger.info("modern diploid genotype をBAMから抽出します: %s", sample)
+                with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+                    references = set(bam.references)
+                    for chrom, chrom_sites in sites_by_chrom.items():
+                        if chrom not in references:
+                            logger.warning("PCA sites contig is absent from BAM header: %s (%s)", chrom, sample)
+                            continue
+                        positions = {}
+                        for idx, site in chrom_sites:
+                            positions.setdefault(site.pos - 1, []).append((idx, site))
+                        start = min(positions)
+                        stop = max(positions) + 1
+                        for column in bam.pileup(
+                            chrom,
+                            start,
+                            stop,
+                            truncate=True,
+                            stepper="samtools",
+                            min_mapping_quality=min_mapq,
+                        ):
+                            target_sites = positions.get(column.reference_pos)
+                            if not target_sites:
+                                continue
+                            for idx, site in target_sites:
+                                ref_count, alt_count, depth = _count_pileup_alleles(column, site, min_baseq, trim_ends)
+                                dosage = _diploid_dosage_from_counts(ref_count, alt_count, depth)
+                                calls_by_site[idx] = (ref_count, alt_count, depth, dosage)
+            for idx, site in enumerate(sites):
+                ref_count, alt_count, depth, dosage = calls_by_site.get(idx, (0, 0, 0, ""))
+                writer.writerow([sample, site.site_id, site.chrom, site.pos, site.ref, site.alt, ref_count, alt_count, depth, dosage])
+    return out_path
+
+
+def build_modern_genotype_matrix(
+    genotype_calls_path: Path,
+    sites: List[PCASite],
+    samples: List[str],
+    out_path: Path,
+) -> Path:
+    calls: Dict[str, Dict[str, str]] = {}
+    with genotype_calls_path.open(errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            calls.setdefault(row["sample"], {})[row["site_id"]] = row.get("dosage", "")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample"] + [site.site_id for site in sites])
+        for sample in sorted(samples):
+            writer.writerow([sample] + [calls.get(sample, {}).get(site.site_id, "") for site in sites])
+    return out_path
+
+
 def filter_matrix(
     matrix_path: Path,
     out_path: Path,
     *,
     max_site_missing: float = 0.9,
     max_sample_missing: float = 0.9,
+    min_maf: float = 0.0,
+    exclude_sex_chr: bool = False,
+    sites: Optional[List[PCASite]] = None,
+    ploidy: int = 1,
 ) -> Path:
+    _filter_matrix(matrix_path, out_path, max_site_missing, max_sample_missing, min_maf, exclude_sex_chr, sites, ploidy)
+    return out_path
+
+
+def _is_sex_chrom(chrom: str) -> bool:
+    normalized = chrom.lower().replace("chr", "")
+    return normalized in {"x", "y", "w", "z", "23", "24"}
+
+
+def _filter_matrix(
+    matrix_path: Path,
+    out_path: Path,
+    max_site_missing: float,
+    max_sample_missing: float,
+    min_maf: float,
+    exclude_sex_chr: bool,
+    sites: Optional[List[PCASite]],
+    ploidy: int,
+) -> MatrixStats:
     with matrix_path.open(errors="replace") as handle:
         reader = csv.reader(handle, delimiter="\t")
         header = next(reader)
@@ -256,12 +518,29 @@ def filter_matrix(
         raise ValueError("No samples remain after PCA missingness filtering")
 
     site_missing = np.mean(np.isnan(data), axis=0)
-    variable = []
+    variable: List[bool] = []
+    maf_keep: List[bool] = []
     for col_idx in range(data.shape[1]):
         values = data[:, col_idx]
         observed = values[~np.isnan(values)]
         variable.append(len(set(observed.tolist())) > 1)
-    keep_sites = (site_missing <= max_site_missing) & np.array(variable, dtype=bool)
+        if len(observed) == 0:
+            maf_keep.append(False)
+        else:
+            allele_freq = float(np.mean(observed) / max(1, ploidy))
+            maf_keep.append(min(allele_freq, 1.0 - allele_freq) >= min_maf)
+
+    site_lookup = {site.site_id: site for site in sites or []}
+    sex_chr_keep: List[bool] = []
+    for site_id in header[1:]:
+        site = site_lookup.get(site_id)
+        sex_chr_keep.append(not (exclude_sex_chr and site and _is_sex_chrom(site.chrom)))
+
+    missing_keep = site_missing <= max_site_missing
+    variable_keep = np.array(variable, dtype=bool)
+    maf_keep_array = np.array(maf_keep, dtype=bool)
+    sex_chr_keep_array = np.array(sex_chr_keep, dtype=bool)
+    keep_sites = missing_keep & variable_keep & maf_keep_array & sex_chr_keep_array
     data = data[:, keep_sites]
     kept_site_ids = [site_id for site_id, keep in zip(header[1:], keep_sites) if keep]
 
@@ -274,7 +553,17 @@ def filter_matrix(
         writer.writerow(["sample"] + kept_site_ids)
         for row, values in zip(kept_rows, data):
             writer.writerow([row[0]] + ["" if np.isnan(value) else str(int(value)) for value in values])
-    return out_path
+
+    return MatrixStats(
+        input_samples=len(rows),
+        input_sites=len(header) - 1,
+        kept_samples=len(kept_rows),
+        kept_sites=len(kept_site_ids),
+        missingness_removed_sites=int(np.sum(~missing_keep)),
+        monomorphic_removed_sites=int(np.sum(missing_keep & ~variable_keep)),
+        maf_removed_sites=int(np.sum(missing_keep & variable_keep & ~maf_keep_array)),
+        sex_chr_removed_sites=int(np.sum(missing_keep & variable_keep & maf_keep_array & ~sex_chr_keep_array)),
+    )
 
 
 def _load_numeric_matrix(matrix_path: Path) -> Tuple[List[str], List[str], np.ndarray]:
@@ -335,6 +624,20 @@ def run_pca_and_mds(matrix_path: Path, pca_dir: Path) -> Tuple[Path, Path, Path]
     return scores_path, variance_path, mds_path
 
 
+def write_mds_from_matrix(matrix_path: Path, out_path: Path) -> Path:
+    samples, _site_ids, data = _load_numeric_matrix(matrix_path)
+    scaled = _impute_and_scale(data)
+    distances = _pairwise_distances(scaled)
+    mds_coords = _classical_mds(distances, dimensions=2)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample", "MDS1", "MDS2"])
+        for sample, values in zip(samples, mds_coords):
+            writer.writerow([sample, "%.8g" % values[0], "%.8g" % values[1]])
+    return out_path
+
+
 def _pairwise_distances(data: np.ndarray) -> np.ndarray:
     n_samples = data.shape[0]
     distances = np.zeros((n_samples, n_samples), dtype=float)
@@ -388,7 +691,13 @@ def export_eigenstrat(matrix_path: Path, sites: List[PCASite], out_dir: Path) ->
     return geno_path, snp_path, ind_path
 
 
-def export_plink_text(matrix_path: Path, sites: List[PCASite], out_dir: Path) -> Tuple[Path, Path]:
+def export_plink_text(
+    matrix_path: Path,
+    sites: List[PCASite],
+    out_dir: Path,
+    *,
+    pseudo_haploid: bool = False,
+) -> Tuple[Path, Path]:
     samples, site_ids, data = _load_numeric_matrix(matrix_path)
     site_lookup = {site.site_id: site for site in sites}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -405,6 +714,10 @@ def export_plink_text(matrix_path: Path, sites: List[PCASite], out_dir: Path) ->
                     row.extend(["0", "0"])
                 elif int(value) == 0:
                     row.extend([site.ref or "A", site.ref or "A"])
+                elif pseudo_haploid:
+                    row.extend([site.alt or "B", site.alt or "B"])
+                elif int(value) == 1:
+                    row.extend([site.ref or "A", site.alt or "B"])
                 else:
                     row.extend([site.alt or "B", site.alt or "B"])
             writer.writerow(row)
@@ -415,27 +728,240 @@ def export_plink_text(matrix_path: Path, sites: List[PCASite], out_dir: Path) ->
     return tped_path, tfam_path
 
 
+def _write_parfile(path: Path, values: Dict[str, Union[Path, str, int, float]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for key, value in values.items():
+            handle.write("%s: %s\n" % (key, value))
+    return path
+
+
+def _convert_evec_to_tsv(evec_path: Path, out_path: Path) -> Path:
+    rows: List[List[str]] = []
+    components = 0
+    with evec_path.open(errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            if len(parts) < 3:
+                continue
+            sample = parts[0]
+            pcs = parts[1:-1]
+            components = max(components, len(pcs))
+            rows.append([sample] + pcs)
+
+    if not rows:
+        raise ValueError("smartpca evec file contains no sample scores: %s" % evec_path)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample"] + ["PC%d" % (idx + 1) for idx in range(components)])
+        for row in rows:
+            writer.writerow(row)
+    return out_path
+
+
+def _convert_eval_to_tsv(eval_path: Path, out_path: Path) -> Path:
+    eigenvalues: List[float] = []
+    with eval_path.open(errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                eigenvalues.append(float(stripped.split()[0]))
+            except ValueError:
+                continue
+
+    if not eigenvalues:
+        raise ValueError("smartpca eval file contains no eigenvalues: %s" % eval_path)
+
+    total = sum(eigenvalues)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["component", "eigenvalue", "explained_variance"])
+        for idx, value in enumerate(eigenvalues):
+            explained = value / total if total else 0.0
+            writer.writerow(["PC%d" % (idx + 1), "%.8g" % value, "%.8g" % explained])
+    return out_path
+
+
+def _count_pruned_snps(prune_in: Path) -> int:
+    if not prune_in.exists():
+        return 0
+    with prune_in.open(errors="replace") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def run_eigensoft_pca(
+    filtered_matrix: Path,
+    sites: List[PCASite],
+    cohort_dir: Path,
+    qc: PCAQCConfig,
+    *,
+    pseudo_haploid: bool = False,
+) -> Tuple[Tuple[Path, Path, Path], Tuple[Path, Path], Path, Path, Path, int]:
+    plink_dir = cohort_dir / "plink"
+    eigenstrat_dir = cohort_dir / "eigenstrat"
+    pca_dir = cohort_dir / "pca"
+    par_dir = cohort_dir / "eigensoft"
+
+    plink_files = export_plink_text(filtered_matrix, sites, plink_dir, pseudo_haploid=pseudo_haploid)
+    tfile_prefix = plink_dir / "cohort"
+    bed_prefix = plink_dir / "cohort"
+    qc_prefix = plink_dir / "cohort.qc"
+    prune_prefix = plink_dir / "cohort.prune"
+    pruned_prefix = plink_dir / "cohort.pruned"
+
+    _run_command(["plink", "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
+    _run_command(
+        [
+            "plink",
+            "--bfile",
+            str(bed_prefix),
+            "--mind",
+            str(qc.max_sample_missing),
+            "--geno",
+            str(qc.max_site_missing),
+            "--maf",
+            str(qc.min_maf),
+            "--make-bed",
+            "--out",
+            str(qc_prefix),
+        ]
+    )
+    _run_command(
+        [
+            "plink",
+            "--bfile",
+            str(qc_prefix),
+            "--indep-pairwise",
+            str(qc.ld_window),
+            str(qc.ld_step),
+            str(qc.ld_r2),
+            "--out",
+            str(prune_prefix),
+        ]
+    )
+    _run_command(
+        [
+            "plink",
+            "--bfile",
+            str(qc_prefix),
+            "--extract",
+            str(prune_prefix) + ".prune.in",
+            "--make-bed",
+            "--out",
+            str(pruned_prefix),
+        ]
+    )
+
+    geno_path = eigenstrat_dir / "cohort.geno"
+    snp_path = eigenstrat_dir / "cohort.snp"
+    ind_path = eigenstrat_dir / "cohort.ind"
+    eigenstrat_dir.mkdir(parents=True, exist_ok=True)
+    convertf_par = _write_parfile(
+        par_dir / "convertf.par",
+        {
+            "inputformat": "PACKEDPED",
+            "genotypename": str(pruned_prefix) + ".bed",
+            "snpname": str(pruned_prefix) + ".bim",
+            "indivname": str(pruned_prefix) + ".fam",
+            "outputformat": "EIGENSTRAT",
+            "genotypeoutname": geno_path,
+            "snpoutname": snp_path,
+            "indivoutname": ind_path,
+        },
+    )
+    _run_command(["convertf", "-p", str(convertf_par)])
+
+    pca_dir.mkdir(parents=True, exist_ok=True)
+    evec_path = pca_dir / "cohort.evec"
+    eval_path = pca_dir / "cohort.eval"
+    smartpca_par = _write_parfile(
+        par_dir / "smartpca.par",
+        {
+            "genotypename": geno_path,
+            "snpname": snp_path,
+            "indivname": ind_path,
+            "evecoutname": evec_path,
+            "evaloutname": eval_path,
+            "numoutevec": 10,
+        },
+    )
+    _run_command(["smartpca", "-p", str(smartpca_par)])
+
+    pca_scores = _convert_evec_to_tsv(evec_path, pca_dir / "pca_scores.tsv")
+    pca_variance = _convert_eval_to_tsv(eval_path, pca_dir / "pca_variance.tsv")
+    mds_path = write_mds_from_matrix(filtered_matrix, pca_dir / "mds.tsv")
+
+    return (
+        (geno_path, snp_path, ind_path),
+        plink_files,
+        pca_scores,
+        pca_variance,
+        mds_path,
+        _count_pruned_snps(Path(str(prune_prefix) + ".prune.in")),
+    )
+
+
 def _write_qc_summary(
     out_path: Path,
     samples: List[str],
     sites: List[PCASite],
     filtered_matrix: Path,
+    qc: PCAQCConfig,
+    engine: str,
+    matrix_stats: MatrixStats,
+    data_type: str,
+    ploidy: int,
+    requested_data_type: Optional[str] = None,
+    ld_pruned_sites: Optional[int] = None,
 ) -> Path:
     kept_samples, kept_sites, _data = _load_numeric_matrix(filtered_matrix)
     with out_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["metric", "value"])
+        if requested_data_type:
+            writer.writerow(["requested_data_type", requested_data_type])
+        writer.writerow(["data_type", data_type])
+        writer.writerow(["ploidy", ploidy])
+        writer.writerow(["engine", engine])
+        writer.writerow(["min_mapq", qc.min_mapq])
+        writer.writerow(["min_baseq", qc.min_baseq])
+        writer.writerow(["trim_ends", qc.trim_ends])
+        writer.writerow(["max_sample_missing", qc.max_sample_missing])
+        writer.writerow(["max_site_missing", qc.max_site_missing])
+        writer.writerow(["min_maf", qc.min_maf])
+        writer.writerow(["exclude_sex_chr", qc.exclude_sex_chr])
+        writer.writerow(["ld_window", qc.ld_window])
+        writer.writerow(["ld_step", qc.ld_step])
+        writer.writerow(["ld_r2", qc.ld_r2])
         writer.writerow(["input_samples", len(samples)])
         writer.writerow(["input_sites", len(sites)])
         writer.writerow(["kept_samples", len(kept_samples)])
         writer.writerow(["kept_sites", len(kept_sites)])
+        writer.writerow(["matrix_input_samples", matrix_stats.input_samples])
+        writer.writerow(["matrix_input_sites", matrix_stats.input_sites])
+        writer.writerow(["matrix_kept_samples", matrix_stats.kept_samples])
+        writer.writerow(["matrix_kept_sites", matrix_stats.kept_sites])
+        writer.writerow(["missingness_removed_sites", matrix_stats.missingness_removed_sites])
+        writer.writerow(["monomorphic_removed_sites", matrix_stats.monomorphic_removed_sites])
+        writer.writerow(["maf_removed_sites", matrix_stats.maf_removed_sites])
+        writer.writerow(["sex_chr_removed_sites", matrix_stats.sex_chr_removed_sites])
+        if ld_pruned_sites is not None:
+            writer.writerow(["ld_pruned_sites", ld_pruned_sites])
     return out_path
 
 
 def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Dict[str, Path]:
-    """Run resumable ancient-DNA-oriented cohort PCA/MDS post-processing."""
-    if config.data_type != "ancient":
-        raise NotImplementedError("PCA stage currently supports data_type=ancient only")
+    """Run resumable cohort PCA/MDS post-processing."""
+    if config.data_type not in {"ancient", "modern", "auto"}:
+        raise NotImplementedError("PCA stage supports data_type=ancient, modern, or auto")
 
     pca_sites = getattr(config.args, "pca_sites", None)
     if not pca_sites:
@@ -448,9 +974,21 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
     cohort_dir = config.results_dir / "cohort"
     pca_dir = cohort_dir / "pca"
     sites_table = cohort_dir / "pca_sites.tsv"
-    raw_calls = cohort_dir / "pseudohaploid_raw_calls.tsv"
-    matrix = cohort_dir / "pseudohaploid_matrix.tsv"
-    filtered_matrix = cohort_dir / "pseudohaploid_matrix.filtered.tsv"
+    resolved_data_type = infer_pca_data_type(config, sample_list, cohort_dir)
+    if resolved_data_type == "ancient":
+        raw_calls = cohort_dir / "pseudohaploid_raw_calls.tsv"
+        matrix = cohort_dir / "pseudohaploid_matrix.tsv"
+        filtered_matrix = cohort_dir / "pseudohaploid_matrix.filtered.tsv"
+        ploidy = 1
+        pseudo_haploid = True
+    else:
+        raw_calls = cohort_dir / "modern_genotype_calls.tsv"
+        matrix = cohort_dir / "modern_genotype_matrix.tsv"
+        filtered_matrix = cohort_dir / "modern_genotype_matrix.filtered.tsv"
+        ploidy = 2
+        pseudo_haploid = False
+    qc = _pca_qc_from_args(config.args)
+    engine = getattr(config.args, "pca_engine", "eigensoft")
 
     if _stage_done(sites_table, force):
         sites = read_pca_sites(sites_table)
@@ -458,30 +996,86 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         sites = read_pca_sites(Path(pca_sites))
         write_sites_table(sites, sites_table)
 
-    sample_bams = {
-        sample: config.results_dir / sample / "dedup" / ("%s.dedup.sorted.bam" % sample)
-        for sample in sample_list
-    }
+    if resolved_data_type == "ancient":
+        sample_bams = {
+            sample: _final_dedup_bam(config, sample)
+            for sample in sample_list
+        }
+        if not _stage_done(raw_calls, force):
+            extract_pseudohaploid_calls(
+                sample_bams,
+                sites,
+                raw_calls,
+                min_mapq=qc.min_mapq,
+                min_baseq=qc.min_baseq,
+                trim_ends=qc.trim_ends,
+            )
+        else:
+            logger.info("再開: 既存pseudo-haploid raw callsを使用します: %s", raw_calls)
 
-    if not _stage_done(raw_calls, force):
-        extract_pseudohaploid_calls(sample_bams, sites, raw_calls)
+        if not _stage_done(matrix, force):
+            build_pseudohaploid_matrix(raw_calls, sites, sample_list, matrix)
+        else:
+            logger.info("再開: 既存pseudo-haploid matrixを使用します: %s", matrix)
     else:
-        logger.info("再開: 既存pseudo-haploid raw callsを使用します: %s", raw_calls)
+        sample_bams = {
+            sample: _final_dedup_bam(config, sample)
+            for sample in sample_list
+        }
+        if not _stage_done(raw_calls, force):
+            extract_modern_diploid_calls(
+                sample_bams,
+                sites,
+                raw_calls,
+                min_mapq=qc.min_mapq,
+                min_baseq=qc.min_baseq,
+                trim_ends=qc.trim_ends,
+            )
+        else:
+            logger.info("再開: 既存modern genotype callsを使用します: %s", raw_calls)
 
-    if not _stage_done(matrix, force):
-        build_pseudohaploid_matrix(raw_calls, sites, sample_list, matrix)
+        if not _stage_done(matrix, force):
+            build_modern_genotype_matrix(raw_calls, sites, sample_list, matrix)
+        else:
+            logger.info("再開: 既存modern genotype matrixを使用します: %s", matrix)
+
+    matrix_stats = _filter_matrix(
+        matrix,
+        filtered_matrix,
+        qc.max_site_missing,
+        qc.max_sample_missing,
+        qc.min_maf,
+        qc.exclude_sex_chr,
+        sites,
+        ploidy,
+    )
+
+    ld_pruned_sites: Optional[int] = None
+    if engine == "eigensoft":
+        eigenstrat_files, plink_files, pca_scores, pca_variance, mds, ld_pruned_sites = run_eigensoft_pca(
+            filtered_matrix,
+            sites,
+            cohort_dir,
+            qc,
+            pseudo_haploid=pseudo_haploid,
+        )
     else:
-        logger.info("再開: 既存pseudo-haploid matrixを使用します: %s", matrix)
-
-    if not _stage_done(filtered_matrix, force):
-        filter_matrix(matrix, filtered_matrix)
-    else:
-        logger.info("再開: 既存filtered matrixを使用します: %s", filtered_matrix)
-
-    eigenstrat_files = export_eigenstrat(filtered_matrix, sites, cohort_dir / "eigenstrat")
-    plink_files = export_plink_text(filtered_matrix, sites, cohort_dir / "plink")
-    pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
-    qc_summary = _write_qc_summary(cohort_dir / "pca_qc_summary.tsv", sample_list, sites, filtered_matrix)
+        eigenstrat_files = export_eigenstrat(filtered_matrix, sites, cohort_dir / "eigenstrat")
+        plink_files = export_plink_text(filtered_matrix, sites, cohort_dir / "plink", pseudo_haploid=pseudo_haploid)
+        pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
+    qc_summary = _write_qc_summary(
+        cohort_dir / "pca_qc_summary.tsv",
+        sample_list,
+        sites,
+        filtered_matrix,
+        qc,
+        engine,
+        matrix_stats,
+        resolved_data_type,
+        ploidy,
+        config.data_type,
+        ld_pruned_sites,
+    )
 
     logger.info("cohort PCA/MDS stage が完了しました: %s", cohort_dir)
     return {

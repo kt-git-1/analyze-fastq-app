@@ -13,6 +13,11 @@ class BWAMapper:
     def __init__(self, config):
         self.config = config
 
+    def _effective_data_type(self) -> str:
+        if self.config.data_type == "auto":
+            return "ancient"
+        return self.config.data_type
+
     @staticmethod
     def _adapter_output_path(temp_prefix: Path, suffix: str) -> Path:
         return Path(str(temp_prefix) + suffix)
@@ -59,7 +64,7 @@ class BWAMapper:
                 logger.error("AdapterRemoval に失敗しました: %s / %s: %s", sample_acc, run_id, e)
                 return None
 
-            if self.config.data_type == "ancient":
+            if self._effective_data_type() == "ancient":
                 return self._map_ancient_pe(
                     temp_prefix, bam_dir, run_id, rg_string, sample_acc,
                 )
@@ -209,9 +214,9 @@ class BWAMapper:
             "--basename", str(temp_prefix),
             "--threads", str(self.config.args.threads),
         ]
-        if self.config.data_type == "ancient":
+        if self._effective_data_type() == "ancient":
             cmd.extend(["--minquality", "20", "--minlength", "30", "--collapse"])
-        elif self.config.data_type == "modern":
+        elif self._effective_data_type() == "modern":
             cmd.extend(["--minquality", "25", "--minlength", "25"])
         return cmd
 
@@ -223,9 +228,9 @@ class BWAMapper:
             "--basename", str(temp_prefix),
             "--threads", str(self.config.args.threads),
         ]
-        if self.config.data_type == "ancient":
+        if self._effective_data_type() == "ancient":
             cmd.extend(["--minquality", "20", "--minlength", "30"])
-        elif self.config.data_type == "modern":
+        elif self._effective_data_type() == "modern":
             cmd.extend(["--minquality", "25", "--minlength", "25"])
         return cmd
 

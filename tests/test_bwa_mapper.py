@@ -16,6 +16,11 @@ def test_adapter_removal_commands_for_ancient_and_modern(make_config, tmp_path):
     assert "--collapse" not in cmd
     assert cmd[-4:] == ["--minquality", "25", "--minlength", "25"]
 
+    mapper = BWAMapper(make_config(data_type="auto"))
+    cmd = mapper._build_adapter_removal_cmd_paired("r1.fq.gz", "r2.fq.gz", tmp_path / "out")
+    assert "--collapse" in cmd
+    assert cmd[-5:] == ["--minquality", "20", "--minlength", "30", "--collapse"]
+
 
 def test_bwa_pe_command_includes_threads_reference_and_read_group(monkeypatch, make_config, tmp_path):
     cfg = make_config()
