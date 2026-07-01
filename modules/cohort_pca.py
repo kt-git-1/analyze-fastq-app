@@ -1572,6 +1572,40 @@ def _write_qc_summary(
     return out_path
 
 
+def _write_removed_samples(
+    matrix_path: Path,
+    filtered_matrix: Path,
+    out_path: Path,
+    *,
+    max_sample_missing: float,
+) -> Path:
+    with matrix_path.open(errors="replace") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        header = next(reader)
+        rows = list(reader)
+    kept_samples, _kept_sites, _kept_data = _load_numeric_matrix(filtered_matrix)
+    kept = set(kept_samples)
+    total_sites = max(0, len(header) - 1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample", "called_sites", "total_sites", "missing_rate", "reason"])
+        for row in rows:
+            sample = row[0]
+            if sample in kept:
+                continue
+            values = row[1:]
+            called_sites = sum(1 for value in values if value != "")
+            missing_rate = 1.0 - (called_sites / total_sites) if total_sites else 1.0
+            if missing_rate > max_sample_missing:
+                reason = "sample_missingness_gt_%.3f" % max_sample_missing
+            else:
+                reason = "removed_before_final_matrix"
+            writer.writerow([sample, called_sites, total_sites, "%.6f" % missing_rate, reason])
+    return out_path
+
+
 def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Dict[str, Path]:
     """Run resumable cohort PCA/MDS post-processing."""
     if config.data_type not in {"ancient", "modern", "auto"}:
@@ -1757,6 +1791,12 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         config.data_type,
         ld_pruned_sites,
     )
+    removed_samples = _write_removed_samples(
+        matrix,
+        filtered_matrix,
+        cohort_dir / "pca_removed_samples.tsv",
+        max_sample_missing=qc.max_sample_missing,
+    )
 
     progress.start_stage(7, "完了")
     progress.finish()
@@ -1776,4 +1816,5 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         "pca_variance": pca_variance,
         "mds": mds,
         "qc_summary": qc_summary,
+        "removed_samples": removed_samples,
     }

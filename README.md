@@ -501,6 +501,7 @@ data/
       modern_genotype_matrix.tsv
       modern_genotype_matrix.filtered.tsv
       pca_qc_summary.tsv
+      pca_removed_samples.tsv
       eigenstrat/
         cohort.geno
         cohort.snp
@@ -545,9 +546,28 @@ data/
 | `<sample>.dedup.sorted.bam` | 後段解析に使う最終BAM |
 | `<sample>.vcf` | sampleごとのHaplotypeCaller出力 |
 | `pca_qc_summary.tsv` | PCA入力数、残ったsample/site数、QC条件、data_type |
+| `pca_removed_samples.tsv` | PCA matrix QC filterで除外されたsample、callable site数、欠損率、除外理由 |
 | `pca_scores.tsv` | PCA座標。散布図作成に使う |
 | `pca_variance.tsv` | 各PCの固有値と説明分散 |
 | `mds.tsv` | MDS座標 |
+
+PCA散布図をPNG/PDFで作る場合:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --out-prefix data/results/ancient/cohort/pca/pca_PC1_PC2
+```
+
+出力:
+
+```text
+data/results/ancient/cohort/pca/pca_PC1_PC2.png
+data/results/ancient/cohort/pca/pca_PC1_PC2.pdf
+```
+
+サンプル名も点の横に表示したい場合は `--label-samples` を付けます。PC3/PC4などを見る場合は `--x PC3 --y PC4` を指定します。
 
 ## チェックポイントと再開
 
@@ -696,6 +716,8 @@ samtools index input.bam
 ### PCAでsample/siteが残らない
 
 `pca_qc_summary.tsv` を確認してください。欠損率、MAF、性染色体除外、LD pruningで落ちている可能性があります。まずは `--pca-max-sample-missing` と `--pca-max-site-missing` を緩める、`--pca-min-maf 0.0` にする、`--pca-exclude-sex-chr` を外す、などを試してください。
+
+除外されたsampleを確認する場合は、`data/results/<project>/cohort/pca_removed_samples.tsv` を見ます。`missing_rate` が `max_sample_missing` より大きいsampleは、PCA matrix QC filterで除外されています。
 
 低depth ancient DNAでは、最初の確認として次のように欠損許容を緩めると、PCA matrixが作れるかを切り分けやすくなります。
 

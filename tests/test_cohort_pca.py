@@ -64,6 +64,7 @@ def test_run_cohort_pca_generates_resumable_outputs(monkeypatch, make_config, tm
     assert outputs["plink_tped"].exists()
     assert outputs["pca_scores"].exists()
     assert outputs["mds"].exists()
+    assert outputs["removed_samples"].exists()
     assert "PC1" in outputs["pca_scores"].read_text()
 
 
@@ -100,6 +101,26 @@ def test_filter_matrix_applies_missing_maf_and_sex_chrom_qc(tmp_path):
     assert stats.monomorphic_removed_sites == 1
     assert stats.missingness_removed_sites == 1
     assert stats.sex_chr_removed_sites == 1
+
+
+def test_write_removed_samples_reports_samples_removed_by_missingness(tmp_path):
+    matrix = tmp_path / "matrix.tsv"
+    filtered = tmp_path / "matrix.filtered.tsv"
+    removed = tmp_path / "pca_removed_samples.tsv"
+    matrix.write_text(
+        "sample\trs1\trs2\trs3\n"
+        "S1\t0\t1\t0\n"
+        "S2\t\t\t1\n"
+        "S3\t\t\t\n"
+    )
+    filtered.write_text("sample\trs1\trs2\nS1\t0\t1\n")
+
+    cohort_pca._write_removed_samples(matrix, filtered, removed, max_sample_missing=0.8)
+
+    lines = removed.read_text().splitlines()
+    assert lines[0] == "sample\tcalled_sites\ttotal_sites\tmissing_rate\treason"
+    assert "S2\t1\t3\t0.666667\tremoved_before_final_matrix" in lines
+    assert "S3\t0\t3\t1.000000\tsample_missingness_gt_0.800" in lines
 
 
 def test_plink_chr_set_args_uses_nonhuman_autosome_count():
