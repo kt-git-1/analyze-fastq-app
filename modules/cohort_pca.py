@@ -1304,6 +1304,7 @@ def run_eigensoft_pca(
     qc_prefix = plink_dir / "cohort.qc"
     prune_prefix = plink_dir / "cohort.prune"
     pruned_prefix = plink_dir / "cohort.pruned"
+    maf_args = ["--maf", str(qc.min_maf)] if qc.min_maf > 0 else []
 
     bed_files = [Path(str(bed_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
     if _stages_done(bed_files, force):
@@ -1335,8 +1336,7 @@ def run_eigensoft_pca(
                 str(qc.max_sample_missing),
                 "--geno",
                 str(qc.max_site_missing),
-                "--maf",
-                str(qc.min_maf),
+                *maf_args,
                 "--make-bed",
                 "--out",
                 str(qc_prefix),
