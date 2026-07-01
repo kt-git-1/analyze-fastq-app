@@ -51,6 +51,10 @@ def _format_duration(seconds: float) -> str:
     return "約 %d秒" % sec
 
 
+def _format_int(value: int) -> str:
+    return f"{value:,}"
+
+
 def _shorten_middle(text: str, max_width: int) -> str:
     if _display_width(text) <= max_width:
         return text
@@ -91,6 +95,7 @@ class CohortPCADashboard:
         self.callable_sites = 0
         self.completed_samples = 0
         self.failed_samples = 0
+        self.sample_scope = False
         self.started_at = time.monotonic()
         self.enabled = enabled
         self.events: List[str] = []
@@ -120,14 +125,17 @@ class CohortPCADashboard:
             self.total_sites = total_sites
             self._render_unlocked(force=True)
 
-    def start_stage(self, stage_index: int, stage_name: str) -> None:
+    def start_stage(self, stage_index: int, stage_name: str, *, sample_scope: bool = False) -> None:
         with self._lock:
             self.stage_index = stage_index
             self.stage_name = stage_name
+            self.sample_scope = sample_scope
             self.contig_index = 0
             self.total_contigs = 0
             self.contig_name = "-"
             self.contig_sites = 0
+            if not sample_scope:
+                self.sample_name = "-"
             self._add_event_unlocked("開始: %s" % stage_name)
             self._render_unlocked(force=True)
 
@@ -135,6 +143,7 @@ class CohortPCADashboard:
         with self._lock:
             self.sample_index = sample_index
             self.sample_name = sample_name
+            self.sample_scope = True
             self.contig_index = 0
             self.contig_name = "-"
             self.contig_sites = 0
@@ -172,43 +181,67 @@ class CohortPCADashboard:
 
     def _render_text_unlocked(self) -> str:
         terminal_width = shutil.get_terminal_size((100, 20)).columns
-        name_width = max(18, min(42, terminal_width - 34))
+        name_width = max(18, min(46, terminal_width - 34))
         stage_percent = int(round(self.stage_index / self.total_stages * 100)) if self.total_stages else 0
+        sample_percent = int(round(self.sample_index / self.total_samples * 100)) if self.total_samples else 0
         contig_percent = int(round(self.contig_index / self.total_contigs * 100)) if self.total_contigs else 0
         event_lines = self.events or ["-"]
-        current_text = self.stage_name
-        if self.contig_name != "-":
-            current_text = "%s / %s" % (self.stage_name, self.contig_name)
+        sample_stage = self.sample_scope
 
-        return "\n".join(
+        lines = [
+            "cohort PCA/MDS",
+            "",
+            "段階      %s  %3d%%  %d/%d  %s" % (
+                _progress_bar(self.stage_index, self.total_stages),
+                stage_percent,
+                self.stage_index,
+                self.total_stages,
+                _shorten_middle(self.stage_name, name_width),
+            ),
+            "入力      %d サンプル / %s PCA sites" % (
+                self.total_samples,
+                _format_int(self.total_sites),
+            ),
+            "設定      %s / %s / %d threads" % (self.data_type, self.engine, self.threads),
+        ]
+        if sample_stage:
+            lines.extend(
+                [
+                    "",
+                    "allele抽出",
+                    "サンプル  %s  %3d%%  %d/%d  %s" % (
+                        _progress_bar(self.sample_index, self.total_samples),
+                        sample_percent,
+                        self.sample_index,
+                        self.total_samples,
+                        _shorten_middle(self.sample_name, name_width),
+                    ),
+                    "contig    %s  %3d%%  %d/%d  %s" % (
+                        _progress_bar(self.contig_index, self.total_contigs),
+                        contig_percent,
+                        self.contig_index,
+                        self.total_contigs,
+                        self.contig_name,
+                    ),
+                    "現在領域  %s sites" % _format_int(self.contig_sites),
+                    "callable  %s sites (直近完了サンプル)" % _format_int(self.callable_sites),
+                ]
+            )
+        elif self.completed_samples:
+            lines.extend(
+                [
+                    "抽出済み  %d/%d サンプル" % (self.completed_samples, self.total_samples),
+                    "callable  %s sites (直近サンプル)" % _format_int(self.callable_sites),
+                ]
+            )
+        lines.extend(
             [
-                "解析パイプライン: cohort PCA/MDS (%s / %s)" % (self.data_type, self.engine),
-                "",
-                "全体進捗  %s  %3d%%  %d/%d steps" % (
-                    _progress_bar(self.stage_index, self.total_stages),
-                    stage_percent,
-                    self.stage_index,
-                    self.total_stages,
-                ),
-                "サンプル  %s" % _shorten_middle(self.sample_name, name_width),
-                "現在      %s" % _shorten_middle(current_text, name_width),
-                "ステップ  %s  %3d%%  %d/%d contigs" % (
-                    _progress_bar(self.contig_index, self.total_contigs),
-                    contig_percent,
-                    self.contig_index,
-                    self.total_contigs,
-                ),
-                "入力      %d PCA sites / current contig %d sites" % (self.total_sites, self.contig_sites),
-                "並列数    1 samples",
-                "スレッド  %d / sample" % self.threads,
                 "経過時間  %s" % _format_duration(time.monotonic() - self.started_at),
-                "成功/失敗 %d / %d" % (self.completed_samples, self.failed_samples),
-                "callable  %d sites" % self.callable_sites,
                 "",
                 "最近のイベント",
             ]
-            + ["  %s" % line for line in event_lines]
         )
+        return "\n".join(lines + ["  %s" % line for line in event_lines])
 
     def _render_unlocked(self, force: bool = False) -> None:
         if not self.enabled:
@@ -1444,7 +1477,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             sample: _final_dedup_bam(config, sample)
             for sample in sample_list
         }
-        progress.start_stage(2, "pseudo-haploid allele 抽出")
+        progress.start_stage(2, "pseudo-haploid allele 抽出", sample_scope=True)
         if not _stage_done(raw_calls, force):
             extract_pseudohaploid_calls(
                 sample_bams,
@@ -1468,7 +1501,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             sample: _final_dedup_bam(config, sample)
             for sample in sample_list
         }
-        progress.start_stage(2, "modern genotype 抽出")
+        progress.start_stage(2, "modern genotype 抽出", sample_scope=True)
         if not _stage_done(raw_calls, force):
             extract_modern_diploid_calls(
                 sample_bams,
