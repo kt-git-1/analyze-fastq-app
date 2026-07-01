@@ -412,7 +412,7 @@ def test_export_plink_text_handles_modern_heterozygotes(tmp_path):
     matrix.write_text("sample\trs1\nS1\t0\nS2\t1\nS3\t2\n")
     sites = [cohort_pca.PCASite("chr1", 10, "rs1", "A", "G")]
 
-    tped, _tfam = cohort_pca.export_plink_text(matrix, sites, tmp_path / "plink")
+    tped, _tfam, _sample_map = cohort_pca.export_plink_text(matrix, sites, tmp_path / "plink")
 
     assert tped.read_text().strip().split("\t") == [
         "1",
@@ -426,3 +426,45 @@ def test_export_plink_text_handles_modern_heterozygotes(tmp_path):
         "G",
         "G",
     ]
+
+
+def test_eigensoft_pipeline_uses_short_plink_ids_and_restores_sample_names(monkeypatch, tmp_path):
+    matrix = tmp_path / "filtered.tsv"
+    long_sample = "PE-AncientHorses-01_S1"
+    matrix.write_text("sample\trs1\trs2\n%s\t0\t1\nZYJ2_S9\t1\t0\n" % long_sample)
+    sites = [
+        cohort_pca.PCASite("chr1", 10, "rs1", "A", "G"),
+        cohort_pca.PCASite("chr1", 20, "rs2", "C", "T"),
+    ]
+
+    def fake_run(cmd, cwd=None):
+        if cmd[0].endswith("plink") and "--indep-pairwise" in cmd:
+            prune_prefix = Path(cmd[cmd.index("--out") + 1])
+            prune_prefix.parent.mkdir(parents=True, exist_ok=True)
+            Path(str(prune_prefix) + ".prune.in").write_text("rs1\nrs2\n")
+        if cmd[0].endswith("smartpca"):
+            pca_dir = tmp_path / "cohort" / "pca"
+            pca_dir.mkdir(parents=True, exist_ok=True)
+            (pca_dir / "cohort.evec").write_text(
+                "#eigvals: 2 1\n"
+                "I000001 0.1 0.2 Unknown\n"
+                "I000002 -0.1 0.0 Unknown\n"
+            )
+            (pca_dir / "cohort.eval").write_text("2\n1\n")
+
+    monkeypatch.setattr(cohort_pca, "_run_command", fake_run)
+
+    _eigenstrat, _plink, scores, _variance, _mds, _pruned = cohort_pca.run_eigensoft_pca(
+        matrix,
+        sites,
+        tmp_path / "cohort",
+        cohort_pca.PCAQCConfig(),
+    )
+
+    tfam_lines = (tmp_path / "cohort" / "plink" / "cohort.tfam").read_text().splitlines()
+    assert tfam_lines[0].split()[:2] == ["0", "I000001"]
+    assert long_sample not in tfam_lines[0]
+    assert "I000001\t%s" % long_sample in (
+        tmp_path / "cohort" / "plink" / "sample_id_map.tsv"
+    ).read_text()
+    assert scores.read_text().splitlines()[1].startswith("%s\t" % long_sample)

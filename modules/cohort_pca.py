@@ -323,7 +323,30 @@ def _stages_done(paths: Iterable[Path], force: bool) -> bool:
 
 def _run_command(cmd: List[str], *, cwd: Optional[Path] = None) -> None:
     logger.info("外部コマンドを実行します: %s", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "").strip()
+        if output:
+            lines = output.splitlines()
+            tail = "\n".join(lines[-30:])
+            logger.error("外部コマンド出力（末尾）:\n%s", tail)
+        logger.error(
+            "外部コマンドに失敗しました: exit=%s command=%s",
+            exc.returncode,
+            " ".join(cmd),
+        )
+        raise
+    output = (result.stdout or "").strip()
+    if output:
+        logger.debug("外部コマンド出力:\n%s", output)
 
 
 def _final_dedup_bam(config, sample: str) -> Path:
@@ -1122,6 +1145,35 @@ def write_mds_from_matrix(matrix_path: Path, out_path: Path) -> Path:
     return out_path
 
 
+def _plink_sample_ids(samples: List[str]) -> Dict[str, str]:
+    return {sample: "I%06d" % (idx + 1) for idx, sample in enumerate(samples)}
+
+
+def _write_sample_id_map(path: Path, sample_ids: Dict[str, str]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["plink_id", "sample"])
+        for sample, plink_id in sample_ids.items():
+            writer.writerow([plink_id, sample])
+    return path
+
+
+def _load_sample_id_map(path: Path) -> Dict[str, str]:
+    sample_lookup: Dict[str, str] = {}
+    if not path.exists():
+        return sample_lookup
+    with path.open(errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            plink_id = row.get("plink_id")
+            sample = row.get("sample")
+            if plink_id and sample:
+                sample_lookup[plink_id] = sample
+                sample_lookup["0:%s" % plink_id] = sample
+    return sample_lookup
+
+
 def _pairwise_distances(data: np.ndarray) -> np.ndarray:
     n_samples = data.shape[0]
     distances = np.zeros((n_samples, n_samples), dtype=float)
@@ -1181,12 +1233,14 @@ def export_plink_text(
     out_dir: Path,
     *,
     pseudo_haploid: bool = False,
-) -> Tuple[Path, Path]:
+) -> Tuple[Path, Path, Path]:
     samples, site_ids, data = _load_numeric_matrix(matrix_path)
+    sample_ids = _plink_sample_ids(samples)
     site_lookup = {site.site_id: site for site in sites}
     out_dir.mkdir(parents=True, exist_ok=True)
     tped_path = out_dir / "cohort.tped"
     tfam_path = out_dir / "cohort.tfam"
+    sample_map_path = out_dir / "sample_id_map.tsv"
 
     with tped_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -1208,8 +1262,9 @@ def export_plink_text(
     with tfam_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter=" ")
         for sample in samples:
-            writer.writerow([sample, sample, "0", "0", "0", "-9"])
-    return tped_path, tfam_path
+            writer.writerow(["0", sample_ids[sample], "0", "0", "0", "-9"])
+    _write_sample_id_map(sample_map_path, sample_ids)
+    return tped_path, tfam_path, sample_map_path
 
 
 def _write_parfile(path: Path, values: Dict[str, Union[Path, str, int, float]]) -> Path:
@@ -1220,9 +1275,14 @@ def _write_parfile(path: Path, values: Dict[str, Union[Path, str, int, float]]) 
     return path
 
 
-def _convert_evec_to_tsv(evec_path: Path, out_path: Path) -> Path:
+def _convert_evec_to_tsv(
+    evec_path: Path,
+    out_path: Path,
+    sample_lookup: Optional[Dict[str, str]] = None,
+) -> Path:
     rows: List[List[str]] = []
     components = 0
+    sample_lookup = sample_lookup or {}
     with evec_path.open(errors="replace") as handle:
         for line in handle:
             stripped = line.strip()
@@ -1231,7 +1291,7 @@ def _convert_evec_to_tsv(evec_path: Path, out_path: Path) -> Path:
             parts = stripped.split()
             if len(parts) < 3:
                 continue
-            sample = parts[0]
+            sample = sample_lookup.get(parts[0], parts[0])
             pcs = parts[1:-1]
             components = max(components, len(pcs))
             rows.append([sample] + pcs)
@@ -1289,7 +1349,7 @@ def run_eigensoft_pca(
     *,
     pseudo_haploid: bool = False,
     force: bool = False,
-) -> Tuple[Tuple[Path, Path, Path], Tuple[Path, Path], Path, Path, Path, int]:
+) -> Tuple[Tuple[Path, Path, Path], Tuple[Path, Path, Path], Path, Path, Path, int]:
     plink_dir = cohort_dir / "plink"
     eigenstrat_dir = cohort_dir / "eigenstrat"
     pca_dir = cohort_dir / "pca"
@@ -1299,11 +1359,16 @@ def run_eigensoft_pca(
 
     tped_path = plink_dir / "cohort.tped"
     tfam_path = plink_dir / "cohort.tfam"
-    if _stages_done([tped_path, tfam_path], force):
+    sample_map_path = plink_dir / "sample_id_map.tsv"
+    plink_text_rewritten = False
+    if _stages_done([tped_path, tfam_path, sample_map_path], force):
         logger.info("再開: 既存PLINK text出力を使用します: %s", plink_dir)
-        plink_files = (tped_path, tfam_path)
+        plink_files = (tped_path, tfam_path, sample_map_path)
     else:
         plink_files = export_plink_text(filtered_matrix, sites, plink_dir, pseudo_haploid=pseudo_haploid)
+        plink_text_rewritten = True
+    sample_lookup = _load_sample_id_map(sample_map_path)
+    force_downstream = force or plink_text_rewritten
     tfile_prefix = plink_dir / "cohort"
     bed_prefix = plink_dir / "cohort"
     qc_prefix = plink_dir / "cohort.qc"
@@ -1312,7 +1377,7 @@ def run_eigensoft_pca(
     maf_args = ["--maf", str(qc.min_maf)] if qc.min_maf > 0 else []
 
     bed_files = [Path(str(bed_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
-    if _stages_done(bed_files, force):
+    if _stages_done(bed_files, force_downstream):
         logger.info("再開: 既存PLINK binary出力を使用します: %s", bed_prefix)
     else:
         _run_command(
@@ -1328,7 +1393,7 @@ def run_eigensoft_pca(
         )
 
     qc_files = [Path(str(qc_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
-    if _stages_done(qc_files, force):
+    if _stages_done(qc_files, force_downstream):
         logger.info("再開: 既存PLINK QC出力を使用します: %s", qc_prefix)
     else:
         _run_command(
@@ -1349,7 +1414,7 @@ def run_eigensoft_pca(
         )
 
     prune_in = Path(str(prune_prefix) + ".prune.in")
-    if _stage_done(prune_in, force):
+    if _stage_done(prune_in, force_downstream):
         logger.info("再開: 既存PLINK LD pruningリストを使用します: %s", prune_in)
     else:
         _run_command(
@@ -1368,7 +1433,7 @@ def run_eigensoft_pca(
         )
 
     pruned_files = [Path(str(pruned_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
-    if _stages_done(pruned_files, force):
+    if _stages_done(pruned_files, force_downstream):
         logger.info("再開: 既存PLINK LD pruned出力を使用します: %s", pruned_prefix)
     else:
         _run_command(
@@ -1405,7 +1470,7 @@ def run_eigensoft_pca(
         par_dir / "convertf.par",
         convertf_params,
     )
-    if _stages_done([geno_path, snp_path, ind_path], force):
+    if _stages_done([geno_path, snp_path, ind_path], force_downstream):
         logger.info("再開: 既存EIGENSTRAT出力を使用します: %s", eigenstrat_dir)
     else:
         _run_command([str(CONVERTF_BIN), "-p", str(convertf_par)])
@@ -1427,23 +1492,23 @@ def run_eigensoft_pca(
         par_dir / "smartpca.par",
         smartpca_params,
     )
-    if _stages_done([evec_path, eval_path], force):
+    if _stages_done([evec_path, eval_path], force_downstream):
         logger.info("再開: 既存smartpca出力を使用します: %s", pca_dir)
     else:
         _run_command([str(SMARTPCA_BIN), "-p", str(smartpca_par)])
 
     pca_scores = pca_dir / "pca_scores.tsv"
-    if _stage_done(pca_scores, force):
+    if _stage_done(pca_scores, force_downstream):
         logger.info("再開: 既存PCA score TSVを使用します: %s", pca_scores)
     else:
-        pca_scores = _convert_evec_to_tsv(evec_path, pca_scores)
+        pca_scores = _convert_evec_to_tsv(evec_path, pca_scores, sample_lookup)
     pca_variance = pca_dir / "pca_variance.tsv"
-    if _stage_done(pca_variance, force):
+    if _stage_done(pca_variance, force_downstream):
         logger.info("再開: 既存PCA variance TSVを使用します: %s", pca_variance)
     else:
         pca_variance = _convert_eval_to_tsv(eval_path, pca_variance)
     mds_path = pca_dir / "mds.tsv"
-    if _stage_done(mds_path, force):
+    if _stage_done(mds_path, force_downstream):
         logger.info("再開: 既存MDS TSVを使用します: %s", mds_path)
     else:
         mds_path = write_mds_from_matrix(filtered_matrix, mds_path)
@@ -1662,7 +1727,11 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         else:
             eigenstrat_files = export_eigenstrat(filtered_matrix, sites, eigenstrat_dir)
         plink_dir = cohort_dir / "plink"
-        plink_files = (plink_dir / "cohort.tped", plink_dir / "cohort.tfam")
+        plink_files = (
+            plink_dir / "cohort.tped",
+            plink_dir / "cohort.tfam",
+            plink_dir / "sample_id_map.tsv",
+        )
         if _stages_done(plink_files, force):
             logger.info("再開: 既存PLINK text出力を使用します: %s", plink_dir)
         else:
