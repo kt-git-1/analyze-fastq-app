@@ -34,3 +34,9 @@ def test_auto_group_prefix_uses_sample_name_prefix():
     )
 
     assert groups == ["PE-AncientHorses", "PE-AncientHorses", "ZYJ2"]
+
+
+def test_group_colors_are_distinct_for_two_groups():
+    plot_pca_scores = _load_plot_module()
+
+    assert plot_pca_scores._group_colors(2) == ["#0072B2", "#D55E00"]

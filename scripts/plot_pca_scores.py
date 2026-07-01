@@ -72,12 +72,30 @@ def _auto_group_values(samples, mode):
     return [_auto_group_value(sample, mode) for sample in samples]
 
 
-def _scatter_by_group(ax, x_values, y_values, groups, legend_title):
-    if not groups:
-        ax.scatter(x_values, y_values, s=42, alpha=0.85, edgecolors="black", linewidths=0.35)
-        return
+def _group_colors(group_count):
+    palette = [
+        "#0072B2",  # blue
+        "#D55E00",  # vermillion
+        "#009E73",  # green
+        "#CC79A7",  # reddish purple
+        "#E69F00",  # orange
+        "#56B4E9",  # sky blue
+        "#F0E442",  # yellow
+        "#000000",  # black
+    ]
+    if group_count <= len(palette):
+        return palette[:group_count]
 
     import matplotlib.pyplot as plt
+
+    cmap = plt.get_cmap("tab20")
+    return [cmap(idx % 20) for idx in range(group_count)]
+
+
+def _scatter_by_group(ax, x_values, y_values, groups, legend_title):
+    if not groups:
+        ax.scatter(x_values, y_values, s=54, alpha=0.9, edgecolors="white", linewidths=0.7)
+        return
 
     group_order = []
     seen = set()
@@ -85,20 +103,18 @@ def _scatter_by_group(ax, x_values, y_values, groups, legend_title):
         if group not in seen:
             seen.add(group)
             group_order.append(group)
-    cmap = plt.get_cmap("tab20")
-    color_count = max(1, min(20, len(group_order)))
+    colors = _group_colors(len(group_order))
     for idx, group in enumerate(group_order):
         indices = [row_idx for row_idx, value in enumerate(groups) if value == group]
-        color = cmap(idx % color_count)
         ax.scatter(
             [x_values[row_idx] for row_idx in indices],
             [y_values[row_idx] for row_idx in indices],
-            s=46,
-            alpha=0.88,
-            edgecolors="black",
-            linewidths=0.35,
+            s=58,
+            alpha=0.92,
+            edgecolors="white",
+            linewidths=0.75,
             label=group,
-            color=color,
+            color=colors[idx],
         )
     ax.legend(title=legend_title, loc="best", fontsize=8, title_fontsize=9, frameon=True)
 
@@ -141,7 +157,7 @@ def plot_pca(
     y_values = [float(row[y_component]) for row in rows]
     if auto_group:
         groups = _auto_group_values(samples, auto_group)
-        legend_title = auto_group
+        legend_title = "group"
     else:
         groups = _group_values(samples, metadata, color_by) if color_by else []
         legend_title = color_by or "group"
