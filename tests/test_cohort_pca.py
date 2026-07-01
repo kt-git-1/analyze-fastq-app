@@ -102,6 +102,19 @@ def test_filter_matrix_applies_missing_maf_and_sex_chrom_qc(tmp_path):
     assert stats.sex_chr_removed_sites == 1
 
 
+def test_plink_chr_set_args_uses_nonhuman_autosome_count():
+    assert cohort_pca._plink_chr_set_args(
+        [
+            cohort_pca.PCASite("chr1", 10, "rs1", "A", "G"),
+            cohort_pca.PCASite("chr31", 20, "rs31", "C", "T"),
+            cohort_pca.PCASite("chrX", 30, "rsX", "G", "A"),
+        ]
+    ) == ["--chr-set", "31"]
+    assert cohort_pca._plink_chr_set_args(
+        [cohort_pca.PCASite("chr22", 10, "rs22", "A", "G")]
+    ) == []
+
+
 def test_run_cohort_pca_passes_extraction_qc(monkeypatch, make_config, tmp_path):
     cfg = make_config()
     cfg.args.pca_sites = tmp_path / "sites.vcf"

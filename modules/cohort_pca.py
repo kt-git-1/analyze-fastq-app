@@ -865,6 +865,22 @@ def _is_sex_chrom(chrom: str) -> bool:
     return normalized in {"x", "y", "w", "z", "23", "24"}
 
 
+def _plink_chr_set_args(sites: List[PCASite]) -> List[str]:
+    autosomes: List[int] = []
+    for site in sites:
+        normalized = site.chrom.lower().replace("chr", "")
+        if normalized in {"x", "y", "w", "z", "xy", "m", "mt"}:
+            continue
+        if normalized.isdigit():
+            autosomes.append(int(normalized))
+    if not autosomes:
+        return []
+    max_autosome = max(autosomes)
+    if max_autosome <= 22:
+        return []
+    return ["--chr-set", str(max_autosome)]
+
+
 def _filter_matrix(
     matrix_path: Path,
     out_path: Path,
@@ -1274,6 +1290,7 @@ def run_eigensoft_pca(
     eigenstrat_dir = cohort_dir / "eigenstrat"
     pca_dir = cohort_dir / "pca"
     par_dir = cohort_dir / "eigensoft"
+    plink_chr_args = _plink_chr_set_args(sites)
 
     tped_path = plink_dir / "cohort.tped"
     tfam_path = plink_dir / "cohort.tfam"
@@ -1292,7 +1309,17 @@ def run_eigensoft_pca(
     if _stages_done(bed_files, force):
         logger.info("再開: 既存PLINK binary出力を使用します: %s", bed_prefix)
     else:
-        _run_command([str(PLINK_BIN), "--tfile", str(tfile_prefix), "--make-bed", "--out", str(bed_prefix)])
+        _run_command(
+            [
+                str(PLINK_BIN),
+                "--tfile",
+                str(tfile_prefix),
+                *plink_chr_args,
+                "--make-bed",
+                "--out",
+                str(bed_prefix),
+            ]
+        )
 
     qc_files = [Path(str(qc_prefix) + suffix) for suffix in (".bed", ".bim", ".fam")]
     if _stages_done(qc_files, force):
@@ -1303,6 +1330,7 @@ def run_eigensoft_pca(
                 str(PLINK_BIN),
                 "--bfile",
                 str(bed_prefix),
+                *plink_chr_args,
                 "--mind",
                 str(qc.max_sample_missing),
                 "--geno",
@@ -1324,6 +1352,7 @@ def run_eigensoft_pca(
                 str(PLINK_BIN),
                 "--bfile",
                 str(qc_prefix),
+                *plink_chr_args,
                 "--indep-pairwise",
                 str(qc.ld_window),
                 str(qc.ld_step),
@@ -1342,6 +1371,7 @@ def run_eigensoft_pca(
                 str(PLINK_BIN),
                 "--bfile",
                 str(qc_prefix),
+                *plink_chr_args,
                 "--extract",
                 str(prune_in),
                 "--make-bed",
