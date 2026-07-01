@@ -206,9 +206,9 @@ class CohortPCADashboard:
             ),
             "設定      %s / %s / %d threads" % (self.data_type, self.engine, self.threads),
             "欠損許容  sample %.3f / site %.3f" % (self.qc.max_sample_missing, self.qc.max_site_missing),
-            "QC        minMAF %.3f / sexChr除外 %s" % (
+            "QC        最小MAF %.3f / 性染色体除外 %s" % (
                 self.qc.min_maf,
-                "yes" if self.qc.exclude_sex_chr else "no",
+                "あり" if self.qc.exclude_sex_chr else "なし",
             ),
         ]
         if sample_stage:
