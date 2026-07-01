@@ -865,7 +865,7 @@ def _is_sex_chrom(chrom: str) -> bool:
     return normalized in {"x", "y", "w", "z", "23", "24"}
 
 
-def _plink_chr_set_args(sites: List[PCASite]) -> List[str]:
+def _max_autosome_count(sites: List[PCASite]) -> Optional[int]:
     autosomes: List[int] = []
     for site in sites:
         normalized = site.chrom.lower().replace("chr", "")
@@ -874,9 +874,13 @@ def _plink_chr_set_args(sites: List[PCASite]) -> List[str]:
         if normalized.isdigit():
             autosomes.append(int(normalized))
     if not autosomes:
-        return []
-    max_autosome = max(autosomes)
-    if max_autosome <= 22:
+        return None
+    return max(autosomes)
+
+
+def _plink_chr_set_args(sites: List[PCASite]) -> List[str]:
+    max_autosome = _max_autosome_count(sites)
+    if max_autosome is None or max_autosome <= 22:
         return []
     return ["--chr-set", str(max_autosome)]
 
@@ -1290,6 +1294,7 @@ def run_eigensoft_pca(
     eigenstrat_dir = cohort_dir / "eigenstrat"
     pca_dir = cohort_dir / "pca"
     par_dir = cohort_dir / "eigensoft"
+    max_autosome = _max_autosome_count(sites)
     plink_chr_args = _plink_chr_set_args(sites)
 
     tped_path = plink_dir / "cohort.tped"
@@ -1384,18 +1389,21 @@ def run_eigensoft_pca(
     snp_path = eigenstrat_dir / "cohort.snp"
     ind_path = eigenstrat_dir / "cohort.ind"
     eigenstrat_dir.mkdir(parents=True, exist_ok=True)
+    convertf_params: Dict[str, Union[Path, str, int, float]] = {
+        "inputformat": "PACKEDPED",
+        "genotypename": str(pruned_prefix) + ".bed",
+        "snpname": str(pruned_prefix) + ".bim",
+        "indivname": str(pruned_prefix) + ".fam",
+        "outputformat": "EIGENSTRAT",
+        "genotypeoutname": geno_path,
+        "snpoutname": snp_path,
+        "indivoutname": ind_path,
+    }
+    if max_autosome is not None and max_autosome > 22:
+        convertf_params["numchrom"] = max_autosome
     convertf_par = _write_parfile(
         par_dir / "convertf.par",
-        {
-            "inputformat": "PACKEDPED",
-            "genotypename": str(pruned_prefix) + ".bed",
-            "snpname": str(pruned_prefix) + ".bim",
-            "indivname": str(pruned_prefix) + ".fam",
-            "outputformat": "EIGENSTRAT",
-            "genotypeoutname": geno_path,
-            "snpoutname": snp_path,
-            "indivoutname": ind_path,
-        },
+        convertf_params,
     )
     if _stages_done([geno_path, snp_path, ind_path], force):
         logger.info("再開: 既存EIGENSTRAT出力を使用します: %s", eigenstrat_dir)
@@ -1405,16 +1413,19 @@ def run_eigensoft_pca(
     pca_dir.mkdir(parents=True, exist_ok=True)
     evec_path = pca_dir / "cohort.evec"
     eval_path = pca_dir / "cohort.eval"
+    smartpca_params: Dict[str, Union[Path, str, int, float]] = {
+        "genotypename": geno_path,
+        "snpname": snp_path,
+        "indivname": ind_path,
+        "evecoutname": evec_path,
+        "evaloutname": eval_path,
+        "numoutevec": 10,
+    }
+    if max_autosome is not None and max_autosome > 22:
+        smartpca_params["numchrom"] = max_autosome
     smartpca_par = _write_parfile(
         par_dir / "smartpca.par",
-        {
-            "genotypename": geno_path,
-            "snpname": snp_path,
-            "indivname": ind_path,
-            "evecoutname": evec_path,
-            "evaloutname": eval_path,
-            "numoutevec": 10,
-        },
+        smartpca_params,
     )
     if _stages_done([evec_path, eval_path], force):
         logger.info("再開: 既存smartpca出力を使用します: %s", pca_dir)

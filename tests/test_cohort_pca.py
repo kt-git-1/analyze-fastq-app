@@ -206,6 +206,38 @@ def test_eigensoft_pipeline_writes_commands_and_parfiles(monkeypatch, tmp_path):
     assert plink_files[0].name == "cohort.tped"
 
 
+def test_eigensoft_pipeline_sets_numchrom_for_nonhuman_autosomes(monkeypatch, tmp_path):
+    matrix = tmp_path / "filtered.tsv"
+    matrix.write_text("sample\trs1\trs31\nS1\t0\t1\nS2\t1\t0\nS3\t1\t1\n")
+    sites = [
+        cohort_pca.PCASite("chr1", 10, "rs1", "A", "G"),
+        cohort_pca.PCASite("chr31", 20, "rs31", "C", "T"),
+    ]
+
+    def fake_run(cmd, cwd=None):
+        if cmd[0].endswith("plink") and "--indep-pairwise" in cmd:
+            prune_prefix = Path(cmd[cmd.index("--out") + 1])
+            prune_prefix.parent.mkdir(parents=True, exist_ok=True)
+            Path(str(prune_prefix) + ".prune.in").write_text("rs1\nrs31\n")
+        if cmd[0].endswith("smartpca"):
+            pca_dir = tmp_path / "cohort" / "pca"
+            pca_dir.mkdir(parents=True, exist_ok=True)
+            (pca_dir / "cohort.evec").write_text("#eigvals: 2 1\nS1 0.1 0.2 Unknown\nS2 -0.1 0.0 Unknown\n")
+            (pca_dir / "cohort.eval").write_text("2\n1\n")
+
+    monkeypatch.setattr(cohort_pca, "_run_command", fake_run)
+
+    cohort_pca.run_eigensoft_pca(
+        matrix,
+        sites,
+        tmp_path / "cohort",
+        cohort_pca.PCAQCConfig(),
+    )
+
+    assert "numchrom: 31" in (tmp_path / "cohort" / "eigensoft" / "convertf.par").read_text()
+    assert "numchrom: 31" in (tmp_path / "cohort" / "eigensoft" / "smartpca.par").read_text()
+
+
 def test_eigensoft_pipeline_resumes_existing_outputs(monkeypatch, tmp_path):
     cohort_dir = tmp_path / "cohort"
     matrix = tmp_path / "filtered.tsv"
