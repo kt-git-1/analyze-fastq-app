@@ -497,8 +497,11 @@ data/
       .done
   logs/
     pipeline_<project>.log
+    pipeline_<project>.log.1
   temp/
 ```
+
+ログファイルは 50MB ごとに自動で切り分けられ、最大5世代まで保持されます。
 
 重要なファイル:
 

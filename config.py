@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import logging
+from logging.handlers import RotatingFileHandler
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,9 @@ from tqdm import tqdm
 from tool_paths import CONVERTF_BIN, PICARD_JAR, PLINK_BIN, SMARTPCA_BIN
 
 logger = logging.getLogger(__name__)
+
+LOG_MAX_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 class PipelineConfig:
     """
@@ -391,7 +395,11 @@ def setup_logging(log_file: Path, use_tqdm: bool = False) -> logging.Logger:
         for handler in logger.handlers
     )
     if not file_exists:
-        file_handler = logging.FileHandler(log_file)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+        )
         file_handler.setFormatter(file_formatter)
         file_handler.setLevel(logging.DEBUG)
         logger.addHandler(file_handler)

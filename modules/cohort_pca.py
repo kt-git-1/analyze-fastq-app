@@ -933,7 +933,28 @@ def _filter_matrix_components(
     kept_rows = [row for row, keep in zip(rows, keep_samples) if keep]
 
     if data.size == 0 or not kept_rows:
-        raise ValueError("No samples remain after PCA missingness filtering")
+        ranked = sorted(
+            ((row[0], float(missing)) for row, missing in zip(rows, sample_missing)),
+            key=lambda item: item[1],
+        )
+        best = ", ".join(
+            "%s=%.2f%%" % (sample, missing * 100.0)
+            for sample, missing in ranked[:5]
+        )
+        median_missing = float(np.median(sample_missing)) if len(sample_missing) else 0.0
+        raise ValueError(
+            "No samples remain after PCA missingness filtering "
+            "(max_sample_missing=%.3f). sample missingness: min=%.2f%% / median=%.2f%% / max=%.2f%%. "
+            "Best samples: %s. "
+            "低深度ancient DNAでは --pca-max-sample-missing を緩めるか、PCA sitesを減らして再実行してください。"
+            % (
+                max_sample_missing,
+                float(np.min(sample_missing)) * 100.0,
+                median_missing * 100.0,
+                float(np.max(sample_missing)) * 100.0,
+                best or "-",
+            )
+        )
 
     site_missing = np.mean(np.isnan(data), axis=0)
     variable: List[bool] = []
@@ -963,7 +984,18 @@ def _filter_matrix_components(
     kept_site_ids = [site_id for site_id, keep in zip(header[1:], keep_sites) if keep]
 
     if data.size == 0 or not kept_site_ids:
-        raise ValueError("No variable SNP sites remain after PCA filtering")
+        raise ValueError(
+            "No variable SNP sites remain after PCA filtering. "
+            "input_sites=%d / missingness_removed=%d / monomorphic_removed=%d / maf_removed=%d / sex_chr_removed=%d. "
+            "必要なら --pca-max-site-missing を緩める、--pca-min-maf を下げる、または --pca-exclude-sex-chr を外して確認してください。"
+            % (
+                len(header) - 1,
+                int(np.sum(~missing_keep)),
+                int(np.sum(missing_keep & ~variable_keep)),
+                int(np.sum(missing_keep & variable_keep & ~maf_keep_array)),
+                int(np.sum(missing_keep & variable_keep & maf_keep_array & ~sex_chr_keep_array)),
+            )
+        )
 
     matrix_stats = MatrixStats(
         input_samples=len(rows),
