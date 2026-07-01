@@ -949,17 +949,30 @@ def _filter_matrix_components(
             for sample, missing in ranked[:5]
         )
         median_missing = float(np.median(sample_missing)) if len(sample_missing) else 0.0
+        if float(np.min(sample_missing)) >= 1.0:
+            reason_hint = (
+                "全サンプルが100%欠損です。低深度の範囲ではなく、PCA raw calls/matrix が空、"
+                "または PCA sites と BAM contig名が一致していない可能性があります。"
+                "ログに「再開: 既存...raw calls/matrix」と出ている場合は、"
+                "data/results/<type>/cohort/pseudohaploid_raw_calls.tsv、"
+                "pseudohaploid_matrix.tsv、pseudohaploid_matrix.filtered.tsv を削除して再抽出してください。"
+            )
+        else:
+            reason_hint = (
+                "低深度ancient DNAでは --pca-max-sample-missing を緩めるか、"
+                "PCA sitesを減らして再実行してください。"
+            )
         raise ValueError(
             "No samples remain after PCA missingness filtering "
             "(max_sample_missing=%.3f). sample missingness: min=%.2f%% / median=%.2f%% / max=%.2f%%. "
-            "Best samples: %s. "
-            "低深度ancient DNAでは --pca-max-sample-missing を緩めるか、PCA sitesを減らして再実行してください。"
+            "Best samples: %s. %s"
             % (
                 max_sample_missing,
                 float(np.min(sample_missing)) * 100.0,
                 median_missing * 100.0,
                 float(np.max(sample_missing)) * 100.0,
                 best or "-",
+                reason_hint,
             )
         )
 
