@@ -309,6 +309,11 @@ def parse_args() -> argparse.Namespace:
         help="PCA matrixから性染色体SNPを除外する",
     )
     parser.add_argument(
+        "--pca-transversion-only",
+        action="store_true",
+        help="PCA matrixでtransversion SNPのみを残す。古DNA damage由来のC/T・G/A影響を抑える",
+    )
+    parser.add_argument(
         "--pca-ld-window",
         type=int,
         default=50,

@@ -80,6 +80,7 @@ def test_parse_args_sets_pca_qc_defaults(monkeypatch):
     assert args.pca_max_site_missing == 0.9
     assert args.pca_min_maf == 0.0
     assert args.pca_exclude_sex_chr is False
+    assert args.pca_transversion_only is False
     assert args.pca_ld_window == 50
     assert args.pca_ld_step == 5
     assert args.pca_ld_r2 == 0.2
@@ -95,6 +96,12 @@ def test_parse_args_rejects_invalid_pca_qc(monkeypatch):
 
     with pytest.raises(SystemExit):
         parse_args()
+
+
+def test_parse_args_accepts_pca_transversion_only(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--pca-transversion-only"])
+
+    assert parse_args().pca_transversion_only is True
 
 
 def test_parse_args_requires_pca_sites_for_run_pca(monkeypatch):

@@ -15,6 +15,7 @@ FASTQ の取得、前処理、BWA マッピング、BAM 処理、QC、VCF 出力
   - [ローカルFASTQを解析する](#1-ローカルfastqを解析する)
   - [既存dedup BAMからQC/VCFだけ実行する](#4-既存dedup-bamからqcvcfだけ実行する)
   - [PCA/MDSまで実行する](#5-pcamdsまで実行する)
+  - [解析別コマンド集](#解析別コマンド集)
 - [入力モードの選び方](#入力モードの選び方)
 - [FASTQディレクトリの指定](#fastqディレクトリの指定)
 - [FASTQ判定ルール](#fastq判定ルール)
@@ -216,6 +217,112 @@ python main.py \
 ```
 
 `auto` は、final dedup BAMのmapped read length中央値を使ってPCA入力を `ancient` / `modern` に分岐します。cohort中央値が100bp以下なら `ancient`、100bp超なら `modern` として扱います。推定結果は `results/<project>/cohort/auto_data_type_summary.tsv` に出力されます。
+
+### 解析別コマンド集
+
+実データでよく使う実行パターンをまとめると次の通りです。パスは自分の環境に合わせて置き換えてください。
+
+FASTQからancient解析を最後まで実行:
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+FASTQからmodern解析を最後まで実行:
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type modern
+```
+
+FASTQからancient/modernを自動判定して解析:
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type auto
+```
+
+既存dedup BAMからQC/VCFだけ実行:
+
+```sh
+python main.py \
+  --bam_dir ./data/results/ancient \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+既存dedup BAMから通常PCA/MDSまで実行:
+
+```sh
+python main.py \
+  --bam_dir ./data/results/ancient \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./data/reference/horse_common_sites.vcf \
+  --pca-engine eigensoft \
+  --pca-max-sample-missing 0.99 \
+  --pca-max-site-missing 0.97 \
+  --pca-exclude-sex-chr
+```
+
+古DNA damageの影響を見たい場合のtransversion-only PCA:
+
+```sh
+python main.py \
+  --bam_dir ./data/results/ancient \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./data/reference/horse_common_sites.vcf \
+  --pca-engine eigensoft \
+  --pca-max-sample-missing 0.99 \
+  --pca-max-site-missing 0.97 \
+  --pca-exclude-sex-chr \
+  --pca-transversion-only
+```
+
+PCA結果からPC1-4の全ペア散布図を作り直す:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --all-pairs 4 \
+  --label-top-n 5 \
+  --out-prefix data/results/ancient/cohort/pca/plots
+```
+
+transversion-only PCAの散布図を作り直す:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/transversion_only/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/transversion_only/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --all-pairs 4 \
+  --label-top-n 5 \
+  --out-prefix data/results/ancient/cohort/transversion_only/pca/plots
+```
+
+PCAの結果を表で確認:
+
+```sh
+cat data/results/ancient/cohort/pca_report.tsv
+head data/results/ancient/cohort/pca_sample_missingness.tsv
+cat data/results/ancient/cohort/pca_removed_samples.tsv
+```
 
 ## 入力モードの選び方
 
@@ -462,6 +569,7 @@ python main.py \
   --pca-max-site-missing 0.9 \
   --pca-min-maf 0.01 \
   --pca-exclude-sex-chr \
+  --pca-transversion-only \
   --pca-ld-window 50 \
   --pca-ld-step 5 \
   --pca-ld-r2 0.2
@@ -476,6 +584,7 @@ python main.py \
 | `--pca-max-site-missing` | SNP siteごとの許容欠損率 |
 | `--pca-min-maf` | 最小minor allele frequency |
 | `--pca-exclude-sex-chr` | X/Y/W/Zや23/24などの性染色体siteを除外 |
+| `--pca-transversion-only` | transversion SNPのみを残す。古DNA damage由来のC/T・G/A影響を抑える |
 | `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size |
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size |
 | `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 |
@@ -502,6 +611,14 @@ data/
       modern_genotype_matrix.filtered.tsv
       pca_qc_summary.tsv
       pca_removed_samples.tsv
+      pca_sample_missingness.tsv
+      pca_report.tsv
+      transversion_only/                 # --pca-transversion-only 実行時
+        pca_qc_summary.tsv
+        pca_removed_samples.tsv
+        pca_sample_missingness.tsv
+        pca_report.tsv
+        pca/
       eigenstrat/
         cohort.geno
         cohort.snp
@@ -521,6 +638,12 @@ data/
         pca_scores.tsv
         pca_variance.tsv
         mds.tsv
+        plots/
+          pca_PC1_PC2.png
+          pca_PC1_PC2.pdf
+          pca_PC1_PC3.png
+          ...
+          pca_plots.tsv
     <sample>/
       dedup/
         <sample>.dedup.sorted.bam
@@ -547,11 +670,16 @@ data/
 | `<sample>.vcf` | sampleごとのHaplotypeCaller出力 |
 | `pca_qc_summary.tsv` | PCA入力数、残ったsample/site数、QC条件、data_type |
 | `pca_removed_samples.tsv` | PCA matrix QC filterで除外されたsample、callable site数、欠損率、除外理由 |
+| `pca_sample_missingness.tsv` | PCA matrixの全sampleについて、callable site数、欠損率、PCAに残ったかどうか |
+| `pca_report.tsv` | PCAの主要指標を1行にまとめた比較用summary |
 | `pca_scores.tsv` | PCA座標。散布図作成に使う |
 | `pca_variance.tsv` | 各PCの固有値と説明分散 |
 | `mds.tsv` | MDS座標 |
+| `pca/plots/pca_plots.tsv` | 自動生成されたPC1-4散布図PNG/PDFの一覧 |
 
-PCA散布図をPNG/PDFで作る場合:
+PCA stageでは、`PC1/PC2`, `PC1/PC3`, `PC1/PC4`, `PC2/PC3`, `PC2/PC4`, `PC3/PC4` のPNG/PDFを `pca/plots/` に自動出力します。`matplotlib` がない環境ではPCA本体は継続し、plotだけスキップします。
+
+PCA散布図を手動でPNG/PDFに作り直す場合:
 
 ```sh
 python scripts/plot_pca_scores.py \
@@ -568,6 +696,29 @@ data/results/ancient/cohort/pca/pca_PC1_PC2.pdf
 ```
 
 サンプル名も点の横に表示したい場合は `--label-samples` を付けます。PC3/PC4などを見る場合は `--x PC3 --y PC4` を指定します。
+
+外れた点だけにラベルを付けたい場合は、原点から遠い上位Nサンプルだけを表示できます。
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --label-top-n 5 \
+  --out-prefix data/results/ancient/cohort/pca/pca_PC1_PC2_top5
+```
+
+PC1からPC4までの全ペアをまとめて作る場合:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --all-pairs 4 \
+  --label-top-n 5 \
+  --out-prefix data/results/ancient/cohort/pca/plots
+```
 
 sample名から自動で色分けする場合は `--auto-group prefix` を使います。`PE-AncientHorses-01_S1` は `PE-AncientHorses`、`ZYJ2_S1` は `ZYJ2` として扱います。
 
@@ -601,6 +752,34 @@ python scripts/plot_pca_scores.py \
 ```
 
 `--metadata` だけ指定した場合は `group` 列で色分けします。`population` や `batch` など別の列で色分けする場合は `--color-by population` のように指定してください。
+
+### transversion-only PCAの比較
+
+古DNA damageの影響を確認したい場合は、通常PCAに加えて `--pca-transversion-only` 付きでも実行します。出力は通常PCAを上書きせず、`data/results/<project>/cohort/transversion_only/` 以下に作られます。
+
+```sh
+python main.py \
+  --bam_dir ./data/results/ancient \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./data/reference/horse_common_sites.vcf \
+  --pca-engine eigensoft \
+  --pca-transversion-only
+```
+
+transversion-onlyの図:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/transversion_only/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/transversion_only/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --out-prefix data/results/ancient/cohort/transversion_only/pca/pca_PC1_PC2_by_prefix
+```
+
+通常PCAとtransversion-only PCAで群の位置関係が保たれる場合、古DNA damageだけで分離している可能性は下がります。逆にtransversion-onlyで傾向が消える場合は、damage、低coverage、欠損の影響を疑います。
 
 ## チェックポイントと再開
 
@@ -660,6 +839,7 @@ python main.py \
 | `--pca-max-site-missing` | SNP欠損率の上限 | `0.9` |
 | `--pca-min-maf` | 最小minor allele frequency | `0.0` |
 | `--pca-exclude-sex-chr` | 性染色体SNPをPCA matrixから除外する | `False` |
+| `--pca-transversion-only` | transversion SNPのみをPCA matrixに残す | `False` |
 | `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size | `50` |
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size | `5` |
 | `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 | `0.2` |

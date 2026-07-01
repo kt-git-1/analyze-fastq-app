@@ -3,6 +3,7 @@ import argparse
 import csv
 import re
 from pathlib import Path
+from itertools import combinations
 
 
 def _read_scores(path):
@@ -119,6 +120,17 @@ def _scatter_by_group(ax, x_values, y_values, groups, legend_title):
     ax.legend(title=legend_title, loc="best", fontsize=8, title_fontsize=9, frameon=True)
 
 
+def _label_indices(x_values, y_values, label_top_n):
+    if label_top_n is None or label_top_n <= 0:
+        return []
+    ranked = sorted(
+        range(len(x_values)),
+        key=lambda idx: (x_values[idx] * x_values[idx]) + (y_values[idx] * y_values[idx]),
+        reverse=True,
+    )
+    return ranked[:label_top_n]
+
+
 def plot_pca(
     scores_path,
     variance_path,
@@ -130,6 +142,7 @@ def plot_pca(
     color_by=None,
     sample_column="sample",
     auto_group=None,
+    label_top_n=None,
 ):
     try:
         import matplotlib
@@ -171,9 +184,15 @@ def plot_pca(
     ax.set_title("PCA scatter")
     ax.grid(True, color="#dddddd", linewidth=0.6, alpha=0.7)
 
-    if label_samples:
-        for sample, x_value, y_value in zip(samples, x_values, y_values):
-            ax.annotate(sample, (x_value, y_value), xytext=(3, 3), textcoords="offset points", fontsize=7)
+    label_target_indices = range(len(samples)) if label_samples else _label_indices(x_values, y_values, label_top_n)
+    for idx in label_target_indices:
+        ax.annotate(
+            samples[idx],
+            (x_values[idx], y_values[idx]),
+            xytext=(3, 3),
+            textcoords="offset points",
+            fontsize=7,
+        )
 
     fig.tight_layout()
     png_path = Path(str(out_prefix) + ".png")
@@ -183,6 +202,41 @@ def plot_pca(
     fig.savefig(pdf_path)
     plt.close(fig)
     return png_path, pdf_path
+
+
+def plot_pca_pairs(
+    scores_path,
+    variance_path,
+    out_dir,
+    pc_count,
+    label_samples=False,
+    metadata_path=None,
+    color_by=None,
+    sample_column="sample",
+    auto_group=None,
+    label_top_n=None,
+):
+    outputs = []
+    for left, right in combinations(range(1, pc_count + 1), 2):
+        x_component = "PC%d" % left
+        y_component = "PC%d" % right
+        out_prefix = out_dir / ("pca_%s_%s" % (x_component, y_component))
+        outputs.append(
+            plot_pca(
+                scores_path,
+                variance_path,
+                out_prefix,
+                x_component,
+                y_component,
+                label_samples,
+                metadata_path=metadata_path,
+                color_by=color_by,
+                sample_column=sample_column,
+                auto_group=auto_group,
+                label_top_n=label_top_n,
+            )
+        )
+    return outputs
 
 
 def main():
@@ -198,11 +252,12 @@ def main():
         "--out-prefix",
         type=Path,
         default=None,
-        help="出力prefix。省略時は pca_scores.tsv と同じ場所の pca_PC1_PC2",
+        help="出力prefix。--all-pairs指定時は出力ディレクトリとして扱います。省略時はpca_scores.tsvと同じ場所に出力します。",
     )
     parser.add_argument("--x", default="PC1", help="X軸のPC列名")
     parser.add_argument("--y", default="PC2", help="Y軸のPC列名")
     parser.add_argument("--label-samples", action="store_true", help="点にサンプル名を表示します。")
+    parser.add_argument("--label-top-n", type=int, default=None, help="原点から遠い上位Nサンプルだけにラベルを表示します。")
     parser.add_argument("--metadata", type=Path, default=None, help="sample情報を持つTSV。sample列でpca_scores.tsvと結合します。")
     parser.add_argument("--color-by", default=None, help="metadata TSV内の色分け列名。例: group, population, batch")
     parser.add_argument("--sample-column", default="sample", help="metadata TSV内のsample名列。デフォルト: sample")
@@ -212,13 +267,37 @@ def main():
         default=None,
         help="metadataなしでsample名から自動色分けします。prefixは PE-AncientHorses-01_S1 -> PE-AncientHorses、ZYJ2_S1 -> ZYJ2 のように解釈します。",
     )
+    parser.add_argument(
+        "--all-pairs",
+        type=int,
+        default=None,
+        help="PC1から指定PCまでの全ペアをまとめて出力します。例: --all-pairs 4 はPC1-4の6ペアを出力します。",
+    )
     args = parser.parse_args()
+
+    variance = args.variance or args.scores.parent / "pca_variance.tsv"
+    color_by = args.color_by or ("group" if args.metadata else None)
+    if args.all_pairs:
+        out_dir = args.out_prefix or args.scores.parent
+        for png_path, pdf_path in plot_pca_pairs(
+            args.scores,
+            variance,
+            out_dir,
+            args.all_pairs,
+            label_samples=args.label_samples,
+            metadata_path=args.metadata,
+            color_by=color_by,
+            sample_column=args.sample_column,
+            auto_group=args.auto_group,
+            label_top_n=args.label_top_n,
+        ):
+            print("PNG: %s" % png_path)
+            print("PDF: %s" % pdf_path)
+        return
 
     out_prefix = args.out_prefix
     if out_prefix is None:
         out_prefix = args.scores.parent / ("pca_%s_%s" % (args.x, args.y))
-    variance = args.variance or args.scores.parent / "pca_variance.tsv"
-    color_by = args.color_by or ("group" if args.metadata else None)
     png_path, pdf_path = plot_pca(
         args.scores,
         variance,
@@ -230,6 +309,7 @@ def main():
         color_by=color_by,
         sample_column=args.sample_column,
         auto_group=args.auto_group,
+        label_top_n=args.label_top_n,
     )
     print("PNG: %s" % png_path)
     print("PDF: %s" % pdf_path)

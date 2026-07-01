@@ -65,6 +65,7 @@ def test_run_cohort_pca_generates_resumable_outputs(monkeypatch, make_config, tm
     assert outputs["pca_scores"].exists()
     assert outputs["mds"].exists()
     assert outputs["removed_samples"].exists()
+    assert outputs["sample_missingness"].exists()
     assert "PC1" in outputs["pca_scores"].read_text()
 
 
@@ -92,6 +93,7 @@ def test_filter_matrix_applies_missing_maf_and_sex_chrom_qc(tmp_path):
         max_sample_missing=0.75,
         min_maf=0.25,
         exclude_sex_chr=True,
+        transversion_only=False,
         sites=sites,
         ploidy=1,
     )
@@ -121,6 +123,100 @@ def test_write_removed_samples_reports_samples_removed_by_missingness(tmp_path):
     assert lines[0] == "sample\tcalled_sites\ttotal_sites\tmissing_rate\treason"
     assert "S2\t1\t3\t0.666667\tremoved_before_final_matrix" in lines
     assert "S3\t0\t3\t1.000000\tsample_missingness_gt_0.800" in lines
+
+
+def test_filter_matrix_transversion_only_removes_transitions(tmp_path):
+    matrix = tmp_path / "matrix.tsv"
+    matrix.write_text(
+        "sample\trs_tv\trs_transition\n"
+        "S1\t0\t0\n"
+        "S2\t1\t1\n"
+        "S3\t1\t1\n"
+    )
+    sites = [
+        cohort_pca.PCASite("chr1", 10, "rs_tv", "A", "C"),
+        cohort_pca.PCASite("chr1", 20, "rs_transition", "A", "G"),
+    ]
+
+    out = tmp_path / "filtered.tsv"
+    stats = cohort_pca._filter_matrix(
+        matrix,
+        out,
+        max_site_missing=0.5,
+        max_sample_missing=0.9,
+        min_maf=0.0,
+        exclude_sex_chr=False,
+        transversion_only=True,
+        sites=sites,
+        ploidy=1,
+    )
+
+    assert out.read_text().splitlines()[0] == "sample\trs_tv"
+    assert stats.non_transversion_removed_sites == 1
+
+
+def test_write_sample_missingness_summary_reports_all_samples(tmp_path):
+    matrix = tmp_path / "matrix.tsv"
+    filtered = tmp_path / "matrix.filtered.tsv"
+    summary = tmp_path / "pca_sample_missingness.tsv"
+    matrix.write_text(
+        "sample\trs1\trs2\trs3\n"
+        "S1\t0\t1\t0\n"
+        "S2\t\t\t1\n"
+        "S3\t\t\t\n"
+    )
+    filtered.write_text("sample\trs1\trs2\nS1\t0\t1\n")
+
+    cohort_pca._write_sample_missingness_summary(matrix, filtered, summary, max_sample_missing=0.8)
+
+    lines = summary.read_text().splitlines()
+    assert lines[0] == "sample\tcalled_sites\ttotal_sites\tmissing_sites\tmissing_rate\tkept\treason"
+    assert "S1\t3\t3\t0\t0.000000\tyes\tkept" in lines
+    assert "S3\t0\t3\t3\t1.000000\tno\tsample_missingness_gt_0.800" in lines
+
+
+def test_write_pca_report_summarizes_core_metrics(tmp_path):
+    variance = tmp_path / "pca_variance.tsv"
+    missingness = tmp_path / "pca_sample_missingness.tsv"
+    report = tmp_path / "pca_report.tsv"
+    variance.write_text(
+        "component\teigenvalue\texplained_variance\n"
+        "PC1\t2\t0.5\n"
+        "PC2\t1\t0.25\n"
+        "PC3\t0.5\t0.125\n"
+        "PC4\t0.25\t0.0625\n"
+    )
+    missingness.write_text(
+        "sample\tcalled_sites\ttotal_sites\tmissing_sites\tmissing_rate\tkept\treason\n"
+        "S1\t10\t10\t0\t0.000000\tyes\tkept\n"
+        "S2\t5\t10\t5\t0.500000\tno\tsample_missingness_gt_0.400\n"
+    )
+    stats = cohort_pca.MatrixStats(
+        input_samples=2,
+        input_sites=10,
+        kept_samples=1,
+        kept_sites=4,
+        missingness_removed_sites=2,
+        monomorphic_removed_sites=3,
+        maf_removed_sites=1,
+        sex_chr_removed_sites=0,
+        non_transversion_removed_sites=2,
+    )
+
+    cohort_pca._write_pca_report(
+        report,
+        cohort_pca.PCAQCConfig(transversion_only=True),
+        stats,
+        variance,
+        missingness,
+        ld_pruned_sites=3,
+    )
+
+    lines = report.read_text().splitlines()
+    assert lines[0].startswith("mode\tinput_samples\tkept_samples")
+    assert lines[1].split("\t")[:7] == ["transversion_only", "2", "1", "1", "10", "4", "3"]
+    assert "\t0.5\t0.25\t0.125\t0.0625\t" in lines[1]
+    assert lines[1].endswith("\tTrue\t2")
 
 
 def test_plink_chr_set_args_uses_nonhuman_autosome_count():
@@ -177,6 +273,44 @@ def test_run_cohort_pca_passes_extraction_qc(monkeypatch, make_config, tmp_path)
     cohort_pca.run_cohort_pca(cfg, ["S1", "S2"])
 
     assert captured == {"min_mapq": 12, "min_baseq": 13, "trim_ends": 4}
+
+
+def test_run_cohort_pca_transversion_only_uses_separate_output_dir(monkeypatch, make_config, tmp_path):
+    cfg = make_config()
+    cfg.args.pca_sites = tmp_path / "sites.vcf"
+    cfg.args.pca_engine = "python"
+    cfg.args.pca_transversion_only = True
+    cfg.args.pca_sites.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        "chr1\t10\trs_tv\tA\tC\t.\t.\t.\n"
+        "chr1\t20\trs_transition\tA\tG\t.\t.\t.\n"
+    )
+    for sample in ("S1", "S2", "S3"):
+        touch(cfg.results_dir / sample / "dedup" / ("%s.dedup.sorted.bam" % sample))
+
+    def fake_extract(sample_bams, sites, out_path, **kwargs):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            "sample\tsite_id\tchrom\tpos\tref\talt\tallele\tbaseq\tmapq\n"
+            "S1\trs_tv\tchr1\t10\tA\tC\tA\t35\t60\n"
+            "S1\trs_transition\tchr1\t20\tA\tG\tA\t35\t60\n"
+            "S2\trs_tv\tchr1\t10\tA\tC\tC\t35\t60\n"
+            "S2\trs_transition\tchr1\t20\tA\tG\tG\t35\t60\n"
+            "S3\trs_tv\tchr1\t10\tA\tC\tC\t35\t60\n"
+            "S3\trs_transition\tchr1\t20\tA\tG\tG\t35\t60\n"
+        )
+        return out_path
+
+    monkeypatch.setattr(cohort_pca, "extract_pseudohaploid_calls", fake_extract)
+
+    outputs = cohort_pca.run_cohort_pca(cfg, ["S1", "S2", "S3"])
+
+    assert outputs["filtered_matrix"].parent.name == "transversion_only"
+    assert outputs["pca_scores"].parent == cfg.results_dir / "cohort" / "transversion_only" / "pca"
+    qc_summary = outputs["qc_summary"].read_text()
+    assert "transversion_only\tTrue" in qc_summary
+    assert "non_transversion_removed_sites\t1" in qc_summary
 
 
 def test_eigensoft_pipeline_writes_commands_and_parfiles(monkeypatch, tmp_path):

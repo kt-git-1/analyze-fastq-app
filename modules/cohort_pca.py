@@ -210,6 +210,7 @@ class CohortPCADashboard:
                 self.qc.min_maf,
                 "あり" if self.qc.exclude_sex_chr else "なし",
             ),
+            "SNP       transversion限定 %s" % ("あり" if self.qc.transversion_only else "なし"),
         ]
         if sample_stage:
             lines.extend(
@@ -292,6 +293,7 @@ class PCAQCConfig:
     max_site_missing: float = 0.9
     min_maf: float = 0.0
     exclude_sex_chr: bool = False
+    transversion_only: bool = False
     ld_window: int = 50
     ld_step: int = 5
     ld_r2: float = 0.2
@@ -307,6 +309,7 @@ class MatrixStats:
     monomorphic_removed_sites: int
     maf_removed_sites: int
     sex_chr_removed_sites: int
+    non_transversion_removed_sites: int
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -362,6 +365,7 @@ def _pca_qc_from_args(args) -> PCAQCConfig:
         max_site_missing=getattr(args, "pca_max_site_missing", 0.9),
         min_maf=getattr(args, "pca_min_maf", 0.0),
         exclude_sex_chr=getattr(args, "pca_exclude_sex_chr", False),
+        transversion_only=getattr(args, "pca_transversion_only", False),
         ld_window=getattr(args, "pca_ld_window", 50),
         ld_step=getattr(args, "pca_ld_step", 5),
         ld_r2=getattr(args, "pca_ld_r2", 0.2),
@@ -876,10 +880,21 @@ def filter_matrix(
     max_sample_missing: float = 0.9,
     min_maf: float = 0.0,
     exclude_sex_chr: bool = False,
+    transversion_only: bool = False,
     sites: Optional[List[PCASite]] = None,
     ploidy: int = 1,
 ) -> Path:
-    _filter_matrix(matrix_path, out_path, max_site_missing, max_sample_missing, min_maf, exclude_sex_chr, sites, ploidy)
+    _filter_matrix(
+        matrix_path,
+        out_path,
+        max_site_missing,
+        max_sample_missing,
+        min_maf,
+        exclude_sex_chr,
+        transversion_only,
+        sites,
+        ploidy,
+    )
     return out_path
 
 
@@ -908,6 +923,13 @@ def _plink_chr_set_args(sites: List[PCASite]) -> List[str]:
     return ["--chr-set", str(max_autosome)]
 
 
+def _is_transversion(ref: str, alt: str) -> bool:
+    alleles = {ref.upper(), alt.upper()}
+    if len(alleles) != 2 or not alleles <= {"A", "C", "G", "T"}:
+        return False
+    return alleles not in ({"A", "G"}, {"C", "T"})
+
+
 def _filter_matrix(
     matrix_path: Path,
     out_path: Path,
@@ -915,6 +937,7 @@ def _filter_matrix(
     max_sample_missing: float,
     min_maf: float,
     exclude_sex_chr: bool,
+    transversion_only: bool,
     sites: Optional[List[PCASite]],
     ploidy: int,
 ) -> MatrixStats:
@@ -924,6 +947,7 @@ def _filter_matrix(
         max_sample_missing,
         min_maf,
         exclude_sex_chr,
+        transversion_only,
         sites,
         ploidy,
     )
@@ -944,6 +968,7 @@ def _filter_matrix_stats(
     max_sample_missing: float,
     min_maf: float,
     exclude_sex_chr: bool,
+    transversion_only: bool,
     sites: Optional[List[PCASite]],
     ploidy: int,
 ) -> MatrixStats:
@@ -953,6 +978,7 @@ def _filter_matrix_stats(
         max_sample_missing,
         min_maf,
         exclude_sex_chr,
+        transversion_only,
         sites,
         ploidy,
     )
@@ -965,6 +991,7 @@ def _filter_matrix_components(
     max_sample_missing: float,
     min_maf: float,
     exclude_sex_chr: bool,
+    transversion_only: bool,
     sites: Optional[List[PCASite]],
     ploidy: int,
 ) -> Tuple[MatrixStats, List[List[str]], List[str], np.ndarray]:
@@ -1034,29 +1061,36 @@ def _filter_matrix_components(
 
     site_lookup = {site.site_id: site for site in sites or []}
     sex_chr_keep: List[bool] = []
+    transversion_keep: List[bool] = []
     for site_id in header[1:]:
         site = site_lookup.get(site_id)
         sex_chr_keep.append(not (exclude_sex_chr and site and _is_sex_chrom(site.chrom)))
+        transversion_keep.append(
+            not transversion_only
+            or bool(site and _is_transversion(site.ref, site.alt))
+        )
 
     missing_keep = site_missing <= max_site_missing
     variable_keep = np.array(variable, dtype=bool)
     maf_keep_array = np.array(maf_keep, dtype=bool)
     sex_chr_keep_array = np.array(sex_chr_keep, dtype=bool)
-    keep_sites = missing_keep & variable_keep & maf_keep_array & sex_chr_keep_array
+    transversion_keep_array = np.array(transversion_keep, dtype=bool)
+    keep_sites = missing_keep & variable_keep & maf_keep_array & sex_chr_keep_array & transversion_keep_array
     data = data[:, keep_sites]
     kept_site_ids = [site_id for site_id, keep in zip(header[1:], keep_sites) if keep]
 
     if data.size == 0 or not kept_site_ids:
         raise ValueError(
             "No variable SNP sites remain after PCA filtering. "
-            "input_sites=%d / missingness_removed=%d / monomorphic_removed=%d / maf_removed=%d / sex_chr_removed=%d. "
-            "必要なら --pca-max-site-missing を緩める、--pca-min-maf を下げる、または --pca-exclude-sex-chr を外して確認してください。"
+            "input_sites=%d / missingness_removed=%d / monomorphic_removed=%d / maf_removed=%d / sex_chr_removed=%d / non_transversion_removed=%d. "
+            "必要なら --pca-max-site-missing を緩める、--pca-min-maf を下げる、--pca-exclude-sex-chr を外す、または --pca-transversion-only を外して確認してください。"
             % (
                 len(header) - 1,
                 int(np.sum(~missing_keep)),
                 int(np.sum(missing_keep & ~variable_keep)),
                 int(np.sum(missing_keep & variable_keep & ~maf_keep_array)),
                 int(np.sum(missing_keep & variable_keep & maf_keep_array & ~sex_chr_keep_array)),
+                int(np.sum(missing_keep & variable_keep & maf_keep_array & sex_chr_keep_array & ~transversion_keep_array)),
             )
         )
 
@@ -1069,6 +1103,9 @@ def _filter_matrix_components(
         monomorphic_removed_sites=int(np.sum(missing_keep & ~variable_keep)),
         maf_removed_sites=int(np.sum(missing_keep & variable_keep & ~maf_keep_array)),
         sex_chr_removed_sites=int(np.sum(missing_keep & variable_keep & maf_keep_array & ~sex_chr_keep_array)),
+        non_transversion_removed_sites=int(
+            np.sum(missing_keep & variable_keep & maf_keep_array & sex_chr_keep_array & ~transversion_keep_array)
+        ),
     )
     return matrix_stats, kept_rows, kept_site_ids, data
 
@@ -1334,6 +1371,145 @@ def _convert_eval_to_tsv(eval_path: Path, out_path: Path) -> Path:
     return out_path
 
 
+def _generate_pca_plots(
+    scores_path: Path,
+    variance_path: Path,
+    pca_dir: Path,
+    *,
+    force: bool = False,
+) -> Path:
+    plot_dir = pca_dir / "plots"
+    manifest_path = plot_dir / "pca_plots.tsv"
+    expected_files: List[Path] = []
+    for left in range(1, 5):
+        for right in range(left + 1, 5):
+            prefix = plot_dir / ("pca_PC%d_PC%d" % (left, right))
+            expected_files.extend([Path(str(prefix) + ".png"), Path(str(prefix) + ".pdf")])
+    if _stage_done(manifest_path, force) and _stages_done(expected_files, force):
+        logger.info("再開: 既存PCA plot出力を使用します: %s", plot_dir)
+        return manifest_path
+
+    try:
+        from scripts.plot_pca_scores import plot_pca_pairs
+
+        outputs = plot_pca_pairs(
+            scores_path,
+            variance_path,
+            plot_dir,
+            4,
+            auto_group="prefix",
+        )
+    except SystemExit as exc:
+        logger.warning("PCA plotを作成できませんでした: %s", exc)
+        return manifest_path
+    except Exception:
+        logger.exception("PCA plot作成中にエラーが発生しました")
+        return manifest_path
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["x", "y", "png", "pdf"])
+        for png_path, pdf_path in outputs:
+            stem = png_path.stem
+            parts = stem.split("_")
+            x_component = parts[-2] if len(parts) >= 3 else ""
+            y_component = parts[-1] if len(parts) >= 3 else ""
+            writer.writerow([x_component, y_component, png_path, pdf_path])
+    logger.info("PCA plotを出力しました: %s", plot_dir)
+    return manifest_path
+
+
+def _read_explained_variance(path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not path.exists():
+        return values
+    with path.open(errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            component = row.get("component")
+            explained = row.get("explained_variance")
+            if component and explained is not None:
+                values[component] = explained
+    return values
+
+
+def _missingness_summary_values(path: Path) -> Tuple[str, str, int]:
+    rates: List[float] = []
+    removed = 0
+    if not path.exists():
+        return "", "", 0
+    with path.open(errors="replace") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            try:
+                rates.append(float(row.get("missing_rate", "")))
+            except ValueError:
+                continue
+            if row.get("kept") == "no":
+                removed += 1
+    if not rates:
+        return "", "", removed
+    mean_rate = sum(rates) / len(rates)
+    median_rate = statistics.median(rates)
+    return "%.6f" % mean_rate, "%.6f" % median_rate, removed
+
+
+def _write_pca_report(
+    out_path: Path,
+    qc: PCAQCConfig,
+    matrix_stats: MatrixStats,
+    pca_variance: Path,
+    sample_missingness: Path,
+    *,
+    ld_pruned_sites: Optional[int],
+) -> Path:
+    explained = _read_explained_variance(pca_variance)
+    mean_missing, median_missing, removed_samples = _missingness_summary_values(sample_missingness)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(
+            [
+                "mode",
+                "input_samples",
+                "kept_samples",
+                "removed_samples",
+                "input_sites",
+                "kept_sites",
+                "ld_pruned_sites",
+                "PC1_explained",
+                "PC2_explained",
+                "PC3_explained",
+                "PC4_explained",
+                "mean_missing_rate",
+                "median_missing_rate",
+                "transversion_only",
+                "non_transversion_removed_sites",
+            ]
+        )
+        writer.writerow(
+            [
+                "transversion_only" if qc.transversion_only else "normal",
+                matrix_stats.input_samples,
+                matrix_stats.kept_samples,
+                removed_samples,
+                matrix_stats.input_sites,
+                matrix_stats.kept_sites,
+                "" if ld_pruned_sites is None else ld_pruned_sites,
+                explained.get("PC1", ""),
+                explained.get("PC2", ""),
+                explained.get("PC3", ""),
+                explained.get("PC4", ""),
+                mean_missing,
+                median_missing,
+                qc.transversion_only,
+                matrix_stats.non_transversion_removed_sites,
+            ]
+        )
+    return out_path
+
+
 def _count_pruned_snps(prune_in: Path) -> int:
     if not prune_in.exists():
         return 0
@@ -1552,6 +1728,7 @@ def _write_qc_summary(
         writer.writerow(["max_site_missing", qc.max_site_missing])
         writer.writerow(["min_maf", qc.min_maf])
         writer.writerow(["exclude_sex_chr", qc.exclude_sex_chr])
+        writer.writerow(["transversion_only", qc.transversion_only])
         writer.writerow(["ld_window", qc.ld_window])
         writer.writerow(["ld_step", qc.ld_step])
         writer.writerow(["ld_r2", qc.ld_r2])
@@ -1567,6 +1744,7 @@ def _write_qc_summary(
         writer.writerow(["monomorphic_removed_sites", matrix_stats.monomorphic_removed_sites])
         writer.writerow(["maf_removed_sites", matrix_stats.maf_removed_sites])
         writer.writerow(["sex_chr_removed_sites", matrix_stats.sex_chr_removed_sites])
+        writer.writerow(["non_transversion_removed_sites", matrix_stats.non_transversion_removed_sites])
         if ld_pruned_sites is not None:
             writer.writerow(["ld_pruned_sites", ld_pruned_sites])
     return out_path
@@ -1606,6 +1784,51 @@ def _write_removed_samples(
     return out_path
 
 
+def _write_sample_missingness_summary(
+    matrix_path: Path,
+    filtered_matrix: Path,
+    out_path: Path,
+    *,
+    max_sample_missing: float,
+) -> Path:
+    with matrix_path.open(errors="replace") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        header = next(reader)
+        rows = list(reader)
+    kept_samples, _kept_sites, _kept_data = _load_numeric_matrix(filtered_matrix)
+    kept = set(kept_samples)
+    total_sites = max(0, len(header) - 1)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sample", "called_sites", "total_sites", "missing_sites", "missing_rate", "kept", "reason"])
+        for row in rows:
+            sample = row[0]
+            called_sites = sum(1 for value in row[1:] if value != "")
+            missing_sites = total_sites - called_sites
+            missing_rate = missing_sites / total_sites if total_sites else 1.0
+            kept_value = "yes" if sample in kept else "no"
+            if kept_value == "yes":
+                reason = "kept"
+            elif missing_rate > max_sample_missing:
+                reason = "sample_missingness_gt_%.3f" % max_sample_missing
+            else:
+                reason = "removed_before_final_matrix"
+            writer.writerow(
+                [
+                    sample,
+                    called_sites,
+                    total_sites,
+                    missing_sites,
+                    "%.6f" % missing_rate,
+                    kept_value,
+                    reason,
+                ]
+            )
+    return out_path
+
+
 def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Dict[str, Path]:
     """Run resumable cohort PCA/MDS post-processing."""
     if config.data_type not in {"ancient", "modern", "auto"}:
@@ -1620,22 +1843,25 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         raise ValueError("PCA requires at least two successful samples")
 
     cohort_dir = config.results_dir / "cohort"
-    pca_dir = cohort_dir / "pca"
     sites_table = cohort_dir / "pca_sites.tsv"
     resolved_data_type = infer_pca_data_type(config, sample_list, cohort_dir, force=force)
     if resolved_data_type == "ancient":
         raw_calls = cohort_dir / "pseudohaploid_raw_calls.tsv"
         matrix = cohort_dir / "pseudohaploid_matrix.tsv"
-        filtered_matrix = cohort_dir / "pseudohaploid_matrix.filtered.tsv"
         ploidy = 1
         pseudo_haploid = True
     else:
         raw_calls = cohort_dir / "modern_genotype_calls.tsv"
         matrix = cohort_dir / "modern_genotype_matrix.tsv"
-        filtered_matrix = cohort_dir / "modern_genotype_matrix.filtered.tsv"
         ploidy = 2
         pseudo_haploid = False
     qc = _pca_qc_from_args(config.args)
+    analysis_dir = cohort_dir / "transversion_only" if qc.transversion_only else cohort_dir
+    pca_dir = analysis_dir / "pca"
+    if resolved_data_type == "ancient":
+        filtered_matrix = analysis_dir / "pseudohaploid_matrix.filtered.tsv"
+    else:
+        filtered_matrix = analysis_dir / "modern_genotype_matrix.filtered.tsv"
     engine = getattr(config.args, "pca_engine", "eigensoft")
     progress = CohortPCADashboard(
         resolved_data_type,
@@ -1646,7 +1872,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         enabled=not getattr(config.args, "no_progress", False),
     )
     logger.info(
-        "cohort PCA/MDS stage を開始します: %d samples / data_type=%s / engine=%s / max_sample_missing=%.3f / max_site_missing=%.3f / min_maf=%.3f / exclude_sex_chr=%s",
+        "cohort PCA/MDS stage を開始します: %d samples / data_type=%s / engine=%s / max_sample_missing=%.3f / max_site_missing=%.3f / min_maf=%.3f / exclude_sex_chr=%s / transversion_only=%s",
         len(sample_list),
         resolved_data_type,
         engine,
@@ -1654,6 +1880,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         qc.max_site_missing,
         qc.min_maf,
         qc.exclude_sex_chr,
+        qc.transversion_only,
     )
 
     progress.start_stage(1, "PCA sites 読み込み")
@@ -1723,6 +1950,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             qc.max_sample_missing,
             qc.min_maf,
             qc.exclude_sex_chr,
+            qc.transversion_only,
             sites,
             ploidy,
         )
@@ -1734,6 +1962,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             qc.max_sample_missing,
             qc.min_maf,
             qc.exclude_sex_chr,
+            qc.transversion_only,
             sites,
             ploidy,
         )
@@ -1744,13 +1973,13 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         eigenstrat_files, plink_files, pca_scores, pca_variance, mds, ld_pruned_sites = run_eigensoft_pca(
             filtered_matrix,
             sites,
-            cohort_dir,
+            analysis_dir,
             qc,
             pseudo_haploid=pseudo_haploid,
             force=force,
         )
     else:
-        eigenstrat_dir = cohort_dir / "eigenstrat"
+        eigenstrat_dir = analysis_dir / "eigenstrat"
         eigenstrat_files = (
             eigenstrat_dir / "cohort.geno",
             eigenstrat_dir / "cohort.snp",
@@ -1760,7 +1989,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             logger.info("再開: 既存EIGENSTRAT互換出力を使用します: %s", eigenstrat_dir)
         else:
             eigenstrat_files = export_eigenstrat(filtered_matrix, sites, eigenstrat_dir)
-        plink_dir = cohort_dir / "plink"
+        plink_dir = analysis_dir / "plink"
         plink_files = (
             plink_dir / "cohort.tped",
             plink_dir / "cohort.tfam",
@@ -1777,9 +2006,10 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             logger.info("再開: 既存Python PCA/MDS出力を使用します: %s", pca_dir)
         else:
             pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
+    pca_plots = _generate_pca_plots(pca_scores, pca_variance, pca_dir, force=force)
     progress.start_stage(6, "PCA QC summary 出力")
     qc_summary = _write_qc_summary(
-        cohort_dir / "pca_qc_summary.tsv",
+        analysis_dir / "pca_qc_summary.tsv",
         sample_list,
         sites,
         filtered_matrix,
@@ -1794,14 +2024,28 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
     removed_samples = _write_removed_samples(
         matrix,
         filtered_matrix,
-        cohort_dir / "pca_removed_samples.tsv",
+        analysis_dir / "pca_removed_samples.tsv",
         max_sample_missing=qc.max_sample_missing,
+    )
+    sample_missingness = _write_sample_missingness_summary(
+        matrix,
+        filtered_matrix,
+        analysis_dir / "pca_sample_missingness.tsv",
+        max_sample_missing=qc.max_sample_missing,
+    )
+    pca_report = _write_pca_report(
+        analysis_dir / "pca_report.tsv",
+        qc,
+        matrix_stats,
+        pca_variance,
+        sample_missingness,
+        ld_pruned_sites=ld_pruned_sites,
     )
 
     progress.start_stage(7, "完了")
     progress.finish()
     progress.close()
-    logger.info("cohort PCA/MDS stage が完了しました: %s", cohort_dir)
+    logger.info("cohort PCA/MDS stage が完了しました: %s", analysis_dir)
     return {
         "sites": sites_table,
         "raw_calls": raw_calls,
@@ -1814,7 +2058,10 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         "plink_tfam": plink_files[1],
         "pca_scores": pca_scores,
         "pca_variance": pca_variance,
+        "pca_plots": pca_plots,
         "mds": mds,
         "qc_summary": qc_summary,
         "removed_samples": removed_samples,
+        "sample_missingness": sample_missingness,
+        "pca_report": pca_report,
     }
