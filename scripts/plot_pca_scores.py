@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import re
 from pathlib import Path
 
 
@@ -58,6 +59,19 @@ def _group_values(samples, metadata, color_by):
     return groups
 
 
+def _auto_group_value(sample, mode):
+    if mode == "prefix":
+        match = re.match(r"^(.+?)-\d+_", sample)
+        if match:
+            return match.group(1)
+        return sample.split("_", 1)[0]
+    raise ValueError("unknown auto group mode: %s" % mode)
+
+
+def _auto_group_values(samples, mode):
+    return [_auto_group_value(sample, mode) for sample in samples]
+
+
 def _scatter_by_group(ax, x_values, y_values, groups, legend_title):
     if not groups:
         ax.scatter(x_values, y_values, s=42, alpha=0.85, edgecolors="black", linewidths=0.35)
@@ -99,6 +113,7 @@ def plot_pca(
     metadata_path=None,
     color_by=None,
     sample_column="sample",
+    auto_group=None,
 ):
     try:
         import matplotlib
@@ -124,10 +139,15 @@ def plot_pca(
     samples = [row["sample"] for row in rows]
     x_values = [float(row[x_component]) for row in rows]
     y_values = [float(row[y_component]) for row in rows]
-    groups = _group_values(samples, metadata, color_by) if color_by else []
+    if auto_group:
+        groups = _auto_group_values(samples, auto_group)
+        legend_title = auto_group
+    else:
+        groups = _group_values(samples, metadata, color_by) if color_by else []
+        legend_title = color_by or "group"
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    _scatter_by_group(ax, x_values, y_values, groups, color_by or "group")
+    _scatter_by_group(ax, x_values, y_values, groups, legend_title)
     ax.axhline(0, color="#999999", linewidth=0.7, zorder=0)
     ax.axvline(0, color="#999999", linewidth=0.7, zorder=0)
     ax.set_xlabel(_axis_label(x_component, variance))
@@ -170,6 +190,12 @@ def main():
     parser.add_argument("--metadata", type=Path, default=None, help="sample情報を持つTSV。sample列でpca_scores.tsvと結合します。")
     parser.add_argument("--color-by", default=None, help="metadata TSV内の色分け列名。例: group, population, batch")
     parser.add_argument("--sample-column", default="sample", help="metadata TSV内のsample名列。デフォルト: sample")
+    parser.add_argument(
+        "--auto-group",
+        choices=["prefix"],
+        default=None,
+        help="metadataなしでsample名から自動色分けします。prefixは PE-AncientHorses-01_S1 -> PE-AncientHorses、ZYJ2_S1 -> ZYJ2 のように解釈します。",
+    )
     args = parser.parse_args()
 
     out_prefix = args.out_prefix
@@ -187,6 +213,7 @@ def main():
         metadata_path=args.metadata,
         color_by=color_by,
         sample_column=args.sample_column,
+        auto_group=args.auto_group,
     )
     print("PNG: %s" % png_path)
     print("PDF: %s" % pdf_path)

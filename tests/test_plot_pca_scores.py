@@ -23,3 +23,14 @@ def test_read_metadata_and_group_values(tmp_path):
     groups = plot_pca_scores._group_values(["S1", "S2", "S3"], rows, "group")
 
     assert groups == ["ancient", "modern", "未指定"]
+
+
+def test_auto_group_prefix_uses_sample_name_prefix():
+    plot_pca_scores = _load_plot_module()
+
+    groups = plot_pca_scores._auto_group_values(
+        ["PE-AncientHorses-01_S1", "PE-AncientHorses-16_S16", "ZYJ2_S1"],
+        "prefix",
+    )
+
+    assert groups == ["PE-AncientHorses", "PE-AncientHorses", "ZYJ2"]

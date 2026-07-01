@@ -569,6 +569,16 @@ data/results/ancient/cohort/pca/pca_PC1_PC2.pdf
 
 サンプル名も点の横に表示したい場合は `--label-samples` を付けます。PC3/PC4などを見る場合は `--x PC3 --y PC4` を指定します。
 
+sample名から自動で色分けする場合は `--auto-group prefix` を使います。`PE-AncientHorses-01_S1` は `PE-AncientHorses`、`ZYJ2_S1` は `ZYJ2` として扱います。
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --auto-group prefix \
+  --out-prefix data/results/ancient/cohort/pca/pca_PC1_PC2_by_prefix
+```
+
 群ごとに色分けしたい場合は、sample名とgroupを持つmetadata TSVを用意します。
 
 ```text
