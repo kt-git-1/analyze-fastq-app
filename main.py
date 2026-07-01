@@ -1064,6 +1064,7 @@ def main() -> None:
 
     if getattr(args, "run_pca", False):
         try:
+            logger.info("サンプル処理が完了しました。cohort PCA/MDS stage を開始します。")
             run_cohort_pca(config, succeeded, force=getattr(args, "force", False))
         except Exception:
             logger.exception("cohort PCA/MDS stage に失敗しました")

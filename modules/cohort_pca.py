@@ -2,6 +2,7 @@ import csv
 import logging
 import statistics
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
@@ -280,21 +281,48 @@ def extract_pseudohaploid_calls(
         sites_by_chrom.setdefault(site.chrom, []).append((idx, site))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    total_samples = len(sample_bams)
+    chrom_items = list(sites_by_chrom.items())
+    total_sites = len(sites)
+    logger.info(
+        "PCA allele抽出を開始: %d samples / %d sites / %d contigs",
+        total_samples,
+        total_sites,
+        len(chrom_items),
+    )
+
     with out_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["sample", "site_id", "chrom", "pos", "ref", "alt", "allele", "baseq", "mapq"])
-        for sample, bam_path in sorted(sample_bams.items()):
+        for sample_index, (sample, bam_path) in enumerate(sorted(sample_bams.items()), start=1):
+            sample_started = time.monotonic()
             if not _is_nonempty_file(bam_path):
                 logger.warning("PCA allele extraction skipped missing BAM: %s (%s)", sample, bam_path)
                 continue
-            logger.info("pseudo-haploid allele を抽出します: %s", sample)
+            logger.info(
+                "PCA allele抽出: sample %d/%d %s (%d sites)",
+                sample_index,
+                total_samples,
+                sample,
+                total_sites,
+            )
             calls_by_site: Dict[int, Tuple[str, int, int]] = {}
             with pysam.AlignmentFile(str(bam_path), "rb") as bam:
                 references = set(bam.references)
-                for chrom, chrom_sites in sites_by_chrom.items():
+                for chrom_index, (chrom, chrom_sites) in enumerate(chrom_items, start=1):
                     if chrom not in references:
                         logger.warning("PCA sites contig is absent from BAM header: %s (%s)", chrom, sample)
                         continue
+                    logger.info(
+                        "PCA allele抽出: sample %d/%d %s / contig %d/%d %s (%d sites)",
+                        sample_index,
+                        total_samples,
+                        sample,
+                        chrom_index,
+                        len(chrom_items),
+                        chrom,
+                        len(chrom_sites),
+                    )
                     positions = {}
                     for idx, site in chrom_sites:
                         positions.setdefault(site.pos - 1, []).append((idx, site))
@@ -316,6 +344,18 @@ def extract_pseudohaploid_calls(
                 for idx, site in enumerate(sites):
                     allele, baseq, mapq = calls_by_site.get(idx, ("", 0, 0))
                     writer.writerow([sample, site.site_id, site.chrom, site.pos, site.ref, site.alt, allele, baseq, mapq])
+            called_sites = sum(1 for allele, _baseq, _mapq in calls_by_site.values() if allele)
+            elapsed = time.monotonic() - sample_started
+            logger.info(
+                "PCA allele抽出完了: sample %d/%d %s / callable sites %d/%d (%.2f%%) / %.1f秒",
+                sample_index,
+                total_samples,
+                sample,
+                called_sites,
+                total_sites,
+                (called_sites / total_sites * 100.0) if total_sites else 0.0,
+                elapsed,
+            )
     return out_path
 
 
@@ -429,21 +469,48 @@ def extract_modern_diploid_calls(
         sites_by_chrom.setdefault(site.chrom, []).append((idx, site))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    total_samples = len(sample_bams)
+    chrom_items = list(sites_by_chrom.items())
+    total_sites = len(sites)
+    logger.info(
+        "PCA genotype抽出を開始: %d samples / %d sites / %d contigs",
+        total_samples,
+        total_sites,
+        len(chrom_items),
+    )
+
     with out_path.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["sample", "site_id", "chrom", "pos", "ref", "alt", "ref_count", "alt_count", "depth", "dosage"])
-        for sample, bam_path in sorted(sample_bams.items()):
+        for sample_index, (sample, bam_path) in enumerate(sorted(sample_bams.items()), start=1):
+            sample_started = time.monotonic()
             calls_by_site: Dict[int, Tuple[int, int, int, str]] = {}
             if not _is_nonempty_file(bam_path):
                 logger.warning("modern PCA genotype extraction skipped missing BAM: %s (%s)", sample, bam_path)
             else:
-                logger.info("modern diploid genotype をBAMから抽出します: %s", sample)
+                logger.info(
+                    "PCA genotype抽出: sample %d/%d %s (%d sites)",
+                    sample_index,
+                    total_samples,
+                    sample,
+                    total_sites,
+                )
                 with pysam.AlignmentFile(str(bam_path), "rb") as bam:
                     references = set(bam.references)
-                    for chrom, chrom_sites in sites_by_chrom.items():
+                    for chrom_index, (chrom, chrom_sites) in enumerate(chrom_items, start=1):
                         if chrom not in references:
                             logger.warning("PCA sites contig is absent from BAM header: %s (%s)", chrom, sample)
                             continue
+                        logger.info(
+                            "PCA genotype抽出: sample %d/%d %s / contig %d/%d %s (%d sites)",
+                            sample_index,
+                            total_samples,
+                            sample,
+                            chrom_index,
+                            len(chrom_items),
+                            chrom,
+                            len(chrom_sites),
+                        )
                         positions = {}
                         for idx, site in chrom_sites:
                             positions.setdefault(site.pos - 1, []).append((idx, site))
@@ -467,6 +534,18 @@ def extract_modern_diploid_calls(
             for idx, site in enumerate(sites):
                 ref_count, alt_count, depth, dosage = calls_by_site.get(idx, (0, 0, 0, ""))
                 writer.writerow([sample, site.site_id, site.chrom, site.pos, site.ref, site.alt, ref_count, alt_count, depth, dosage])
+            called_sites = sum(1 for _ref, _alt, _depth, dosage in calls_by_site.values() if dosage)
+            elapsed = time.monotonic() - sample_started
+            logger.info(
+                "PCA genotype抽出完了: sample %d/%d %s / callable sites %d/%d (%.2f%%) / %.1f秒",
+                sample_index,
+                total_samples,
+                sample,
+                called_sites,
+                total_sites,
+                (called_sites / total_sites * 100.0) if total_sites else 0.0,
+                elapsed,
+            )
     return out_path
 
 
@@ -1098,12 +1177,23 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         pseudo_haploid = False
     qc = _pca_qc_from_args(config.args)
     engine = getattr(config.args, "pca_engine", "eigensoft")
+    logger.info(
+        "cohort PCA/MDS stage を開始します: %d samples / data_type=%s / engine=%s / max_sample_missing=%.3f / max_site_missing=%.3f / min_maf=%.3f / exclude_sex_chr=%s",
+        len(sample_list),
+        resolved_data_type,
+        engine,
+        qc.max_sample_missing,
+        qc.max_site_missing,
+        qc.min_maf,
+        qc.exclude_sex_chr,
+    )
 
     if _stage_done(sites_table, force):
         sites = read_pca_sites(sites_table)
     else:
         sites = read_pca_sites(Path(pca_sites))
         write_sites_table(sites, sites_table)
+    logger.info("PCA sitesを読み込みました: %d sites (%s)", len(sites), sites_table)
 
     if resolved_data_type == "ancient":
         sample_bams = {
