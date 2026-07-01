@@ -1065,10 +1065,15 @@ def main() -> None:
     if getattr(args, "run_pca", False):
         try:
             logger.info("サンプル処理が完了しました。cohort PCA/MDS stage を開始します。")
+            if progress_enabled:
+                _set_stream_log_level(logging.WARNING)
             run_cohort_pca(config, succeeded, force=getattr(args, "force", False))
         except Exception:
             logger.exception("cohort PCA/MDS stage に失敗しました")
             sys.exit(1)
+        finally:
+            if progress_enabled:
+                _set_stream_log_level(logging.INFO)
 
     if not bam_mode and succeeded:
         logger.info("中間ファイル削除を開始: 対象 %d サンプル。最終 dedup BAM は保持します。", len(succeeded))

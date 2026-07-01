@@ -1,8 +1,12 @@
 import csv
 import logging
+import shutil
 import statistics
 import subprocess
+import sys
+import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
@@ -12,6 +16,223 @@ import numpy as np
 from tool_paths import CONVERTF_BIN, PLINK_BIN, SMARTPCA_BIN
 
 logger = logging.getLogger(__name__)
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+    return width
+
+
+def _screen_line_count(text: str, terminal_width: int) -> int:
+    terminal_width = max(1, terminal_width)
+    rows = 0
+    for line in text.splitlines() or [""]:
+        rows += max(1, (_display_width(line) + terminal_width - 1) // terminal_width)
+    return rows
+
+
+def _progress_bar(done: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = int(width * min(done, total) / total)
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "約 %d時間%d分" % (hours, minutes)
+    if minutes:
+        return "約 %d分%d秒" % (minutes, sec)
+    return "約 %d秒" % sec
+
+
+def _shorten_middle(text: str, max_width: int) -> str:
+    if _display_width(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return "." * max_width
+    left = max_width // 2 - 1
+    right = max_width - left - 3
+    return text[:left] + "..." + text[-right:]
+
+
+class CohortPCADashboard:
+    """cohort PCA/MDS 用の固定表示ダッシュボード。"""
+
+    def __init__(
+        self,
+        data_type: str,
+        engine: str,
+        total_samples: int,
+        threads: int,
+        total_sites: int = 0,
+        total_stages: int = 7,
+        enabled: bool = True,
+    ) -> None:
+        self.data_type = data_type
+        self.engine = engine
+        self.total_samples = total_samples
+        self.threads = threads
+        self.total_sites = total_sites
+        self.total_stages = total_stages
+        self.stage_index = 0
+        self.stage_name = "-"
+        self.sample_index = 0
+        self.sample_name = "-"
+        self.total_contigs = 0
+        self.contig_index = 0
+        self.contig_name = "-"
+        self.contig_sites = 0
+        self.callable_sites = 0
+        self.completed_samples = 0
+        self.failed_samples = 0
+        self.started_at = time.monotonic()
+        self.enabled = enabled
+        self.events: List[str] = []
+        self._rendered_lines = 0
+        self._last_rendered_at = 0.0
+        self._lock = threading.Lock()
+        self._closed = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        if self.enabled:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat,
+                name="cohort-pca-dashboard-heartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self._closed.wait(1.0):
+            self.render()
+
+    def _add_event_unlocked(self, message: str) -> None:
+        self.events.append("%s  %s" % (time.strftime("%H:%M:%S"), message))
+        self.events = self.events[-4:]
+
+    def set_total_sites(self, total_sites: int) -> None:
+        with self._lock:
+            self.total_sites = total_sites
+            self._render_unlocked(force=True)
+
+    def start_stage(self, stage_index: int, stage_name: str) -> None:
+        with self._lock:
+            self.stage_index = stage_index
+            self.stage_name = stage_name
+            self.contig_index = 0
+            self.total_contigs = 0
+            self.contig_name = "-"
+            self.contig_sites = 0
+            self._add_event_unlocked("開始: %s" % stage_name)
+            self._render_unlocked(force=True)
+
+    def start_sample(self, sample_index: int, sample_name: str) -> None:
+        with self._lock:
+            self.sample_index = sample_index
+            self.sample_name = sample_name
+            self.contig_index = 0
+            self.contig_name = "-"
+            self.contig_sites = 0
+            self.callable_sites = 0
+            self._add_event_unlocked("sample %d/%d: %s" % (sample_index, self.total_samples, sample_name))
+            self._render_unlocked(force=True)
+
+    def start_contig(self, contig_index: int, total_contigs: int, contig_name: str, contig_sites: int) -> None:
+        with self._lock:
+            self.contig_index = contig_index
+            self.total_contigs = total_contigs
+            self.contig_name = contig_name
+            self.contig_sites = contig_sites
+            self._render_unlocked(force=True)
+
+    def finish_sample(self, sample_index: int, sample_name: str, callable_sites: int) -> None:
+        with self._lock:
+            self.sample_index = sample_index
+            self.sample_name = sample_name
+            self.callable_sites = callable_sites
+            self.completed_samples = max(self.completed_samples, sample_index)
+            self._add_event_unlocked("完了: %s / callable %d sites" % (sample_name, callable_sites))
+            self._render_unlocked(force=True)
+
+    def finish(self) -> None:
+        with self._lock:
+            self.stage_index = self.total_stages
+            self.stage_name = "完了"
+            self._add_event_unlocked("cohort PCA/MDS 完了")
+            self._render_unlocked(force=True)
+
+    def render(self, force: bool = False) -> None:
+        with self._lock:
+            self._render_unlocked(force=force)
+
+    def _render_text_unlocked(self) -> str:
+        terminal_width = shutil.get_terminal_size((100, 20)).columns
+        name_width = max(18, min(42, terminal_width - 34))
+        stage_percent = int(round(self.stage_index / self.total_stages * 100)) if self.total_stages else 0
+        contig_percent = int(round(self.contig_index / self.total_contigs * 100)) if self.total_contigs else 0
+        event_lines = self.events or ["-"]
+        current_text = self.stage_name
+        if self.contig_name != "-":
+            current_text = "%s / %s" % (self.stage_name, self.contig_name)
+
+        return "\n".join(
+            [
+                "解析パイプライン: cohort PCA/MDS (%s / %s)" % (self.data_type, self.engine),
+                "",
+                "全体進捗  %s  %3d%%  %d/%d steps" % (
+                    _progress_bar(self.stage_index, self.total_stages),
+                    stage_percent,
+                    self.stage_index,
+                    self.total_stages,
+                ),
+                "サンプル  %s" % _shorten_middle(self.sample_name, name_width),
+                "現在      %s" % _shorten_middle(current_text, name_width),
+                "ステップ  %s  %3d%%  %d/%d contigs" % (
+                    _progress_bar(self.contig_index, self.total_contigs),
+                    contig_percent,
+                    self.contig_index,
+                    self.total_contigs,
+                ),
+                "入力      %d PCA sites / current contig %d sites" % (self.total_sites, self.contig_sites),
+                "並列数    1 samples",
+                "スレッド  %d / sample" % self.threads,
+                "経過時間  %s" % _format_duration(time.monotonic() - self.started_at),
+                "成功/失敗 %d / %d" % (self.completed_samples, self.failed_samples),
+                "callable  %d sites" % self.callable_sites,
+                "",
+                "最近のイベント",
+            ]
+            + ["  %s" % line for line in event_lines]
+        )
+
+    def _render_unlocked(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_rendered_at < 0.2:
+            return
+        text = self._render_text_unlocked()
+        terminal_width = shutil.get_terminal_size((100, 20)).columns
+        if self._rendered_lines:
+            sys.stderr.write("\r\033[%dA\033[J" % self._rendered_lines)
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+        self._rendered_lines = _screen_line_count(text, terminal_width)
+        self._last_rendered_at = now
+
+    def close(self) -> None:
+        self._closed.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2)
+        self.render(force=True)
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 @dataclass(frozen=True)
 class PCASite:
@@ -272,6 +493,7 @@ def extract_pseudohaploid_calls(
     min_mapq: int = 30,
     min_baseq: int = 30,
     trim_ends: int = 2,
+    progress: Optional[CohortPCADashboard] = None,
 ) -> Path:
     """Extract one high-quality allele per sample/site from final dedup BAMs."""
     import pysam
@@ -306,6 +528,8 @@ def extract_pseudohaploid_calls(
                 sample,
                 total_sites,
             )
+            if progress is not None:
+                progress.start_sample(sample_index, sample)
             calls_by_site: Dict[int, Tuple[str, int, int]] = {}
             with pysam.AlignmentFile(str(bam_path), "rb") as bam:
                 references = set(bam.references)
@@ -323,6 +547,8 @@ def extract_pseudohaploid_calls(
                         chrom,
                         len(chrom_sites),
                     )
+                    if progress is not None:
+                        progress.start_contig(chrom_index, len(chrom_items), chrom, len(chrom_sites))
                     positions = {}
                     for idx, site in chrom_sites:
                         positions.setdefault(site.pos - 1, []).append((idx, site))
@@ -356,6 +582,8 @@ def extract_pseudohaploid_calls(
                 (called_sites / total_sites * 100.0) if total_sites else 0.0,
                 elapsed,
             )
+            if progress is not None:
+                progress.finish_sample(sample_index, sample, called_sites)
     return out_path
 
 
@@ -460,6 +688,7 @@ def extract_modern_diploid_calls(
     min_mapq: int = 30,
     min_baseq: int = 30,
     trim_ends: int = 2,
+    progress: Optional[CohortPCADashboard] = None,
 ) -> Path:
     """Extract diploid ref/alt dosage per sample/site from final dedup BAMs."""
     import pysam
@@ -495,6 +724,8 @@ def extract_modern_diploid_calls(
                     sample,
                     total_sites,
                 )
+                if progress is not None:
+                    progress.start_sample(sample_index, sample)
                 with pysam.AlignmentFile(str(bam_path), "rb") as bam:
                     references = set(bam.references)
                     for chrom_index, (chrom, chrom_sites) in enumerate(chrom_items, start=1):
@@ -511,6 +742,8 @@ def extract_modern_diploid_calls(
                             chrom,
                             len(chrom_sites),
                         )
+                        if progress is not None:
+                            progress.start_contig(chrom_index, len(chrom_items), chrom, len(chrom_sites))
                         positions = {}
                         for idx, site in chrom_sites:
                             positions.setdefault(site.pos - 1, []).append((idx, site))
@@ -546,6 +779,8 @@ def extract_modern_diploid_calls(
                 (called_sites / total_sites * 100.0) if total_sites else 0.0,
                 elapsed,
             )
+            if progress is not None:
+                progress.finish_sample(sample_index, sample, called_sites)
     return out_path
 
 
@@ -1177,6 +1412,13 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         pseudo_haploid = False
     qc = _pca_qc_from_args(config.args)
     engine = getattr(config.args, "pca_engine", "eigensoft")
+    progress = CohortPCADashboard(
+        resolved_data_type,
+        engine,
+        len(sample_list),
+        threads=getattr(config.args, "threads", 1),
+        enabled=not getattr(config.args, "no_progress", False),
+    )
     logger.info(
         "cohort PCA/MDS stage を開始します: %d samples / data_type=%s / engine=%s / max_sample_missing=%.3f / max_site_missing=%.3f / min_maf=%.3f / exclude_sex_chr=%s",
         len(sample_list),
@@ -1188,11 +1430,13 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         qc.exclude_sex_chr,
     )
 
+    progress.start_stage(1, "PCA sites 読み込み")
     if _stage_done(sites_table, force):
         sites = read_pca_sites(sites_table)
     else:
         sites = read_pca_sites(Path(pca_sites))
         write_sites_table(sites, sites_table)
+    progress.set_total_sites(len(sites))
     logger.info("PCA sitesを読み込みました: %d sites (%s)", len(sites), sites_table)
 
     if resolved_data_type == "ancient":
@@ -1200,6 +1444,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             sample: _final_dedup_bam(config, sample)
             for sample in sample_list
         }
+        progress.start_stage(2, "pseudo-haploid allele 抽出")
         if not _stage_done(raw_calls, force):
             extract_pseudohaploid_calls(
                 sample_bams,
@@ -1208,10 +1453,12 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
                 min_mapq=qc.min_mapq,
                 min_baseq=qc.min_baseq,
                 trim_ends=qc.trim_ends,
+                progress=progress,
             )
         else:
             logger.info("再開: 既存pseudo-haploid raw callsを使用します: %s", raw_calls)
 
+        progress.start_stage(3, "pseudo-haploid matrix 作成")
         if not _stage_done(matrix, force):
             build_pseudohaploid_matrix(raw_calls, sites, sample_list, matrix)
         else:
@@ -1221,6 +1468,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             sample: _final_dedup_bam(config, sample)
             for sample in sample_list
         }
+        progress.start_stage(2, "modern genotype 抽出")
         if not _stage_done(raw_calls, force):
             extract_modern_diploid_calls(
                 sample_bams,
@@ -1229,15 +1477,18 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
                 min_mapq=qc.min_mapq,
                 min_baseq=qc.min_baseq,
                 trim_ends=qc.trim_ends,
+                progress=progress,
             )
         else:
             logger.info("再開: 既存modern genotype callsを使用します: %s", raw_calls)
 
+        progress.start_stage(3, "modern genotype matrix 作成")
         if not _stage_done(matrix, force):
             build_modern_genotype_matrix(raw_calls, sites, sample_list, matrix)
         else:
             logger.info("再開: 既存modern genotype matrixを使用します: %s", matrix)
 
+    progress.start_stage(4, "PCA matrix QC filter")
     if _stage_done(filtered_matrix, force):
         logger.info("再開: 既存filtered matrixを使用します: %s", filtered_matrix)
         matrix_stats = _filter_matrix_stats(
@@ -1262,6 +1513,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         )
 
     ld_pruned_sites: Optional[int] = None
+    progress.start_stage(5, "PCA/MDS 計算")
     if engine == "eigensoft":
         eigenstrat_files, plink_files, pca_scores, pca_variance, mds, ld_pruned_sites = run_eigensoft_pca(
             filtered_matrix,
@@ -1295,6 +1547,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
             logger.info("再開: 既存Python PCA/MDS出力を使用します: %s", pca_dir)
         else:
             pca_scores, pca_variance, mds = run_pca_and_mds(filtered_matrix, pca_dir)
+    progress.start_stage(6, "PCA QC summary 出力")
     qc_summary = _write_qc_summary(
         cohort_dir / "pca_qc_summary.tsv",
         sample_list,
@@ -1309,6 +1562,9 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         ld_pruned_sites,
     )
 
+    progress.start_stage(7, "完了")
+    progress.finish()
+    progress.close()
     logger.info("cohort PCA/MDS stage が完了しました: %s", cohort_dir)
     return {
         "sites": sites_table,
