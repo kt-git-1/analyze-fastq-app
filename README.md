@@ -569,6 +569,29 @@ data/results/ancient/cohort/pca/pca_PC1_PC2.pdf
 
 サンプル名も点の横に表示したい場合は `--label-samples` を付けます。PC3/PC4などを見る場合は `--x PC3 --y PC4` を指定します。
 
+群ごとに色分けしたい場合は、sample名とgroupを持つmetadata TSVを用意します。
+
+```text
+sample	group
+PE-AncientHorses-01_S1	PE-AncientHorses
+PE-AncientHorses-02_S2	PE-AncientHorses
+ZYJ2_S1	ZYJ2
+ZYJ2_S2	ZYJ2
+```
+
+色分けして散布図を作る場合:
+
+```sh
+python scripts/plot_pca_scores.py \
+  data/results/ancient/cohort/pca/pca_scores.tsv \
+  --variance data/results/ancient/cohort/pca/pca_variance.tsv \
+  --metadata data/results/ancient/cohort/pca_metadata.tsv \
+  --color-by group \
+  --out-prefix data/results/ancient/cohort/pca/pca_PC1_PC2_by_group
+```
+
+`--metadata` だけ指定した場合は `group` 列で色分けします。`population` や `batch` など別の列で色分けする場合は `--color-by population` のように指定してください。
+
 ## チェックポイントと再開
 
 sample解析が成功すると、`results/<project>/<sample>/.done` が作られます。再実行時は `.done` があるsampleをスキップします。
