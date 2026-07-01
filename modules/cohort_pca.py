@@ -74,6 +74,7 @@ class CohortPCADashboard:
         engine: str,
         total_samples: int,
         threads: int,
+        qc: "PCAQCConfig",
         total_sites: int = 0,
         total_stages: int = 7,
         enabled: bool = True,
@@ -82,6 +83,7 @@ class CohortPCADashboard:
         self.engine = engine
         self.total_samples = total_samples
         self.threads = threads
+        self.qc = qc
         self.total_sites = total_sites
         self.total_stages = total_stages
         self.stage_index = 0
@@ -203,6 +205,11 @@ class CohortPCADashboard:
                 _format_int(self.total_sites),
             ),
             "設定      %s / %s / %d threads" % (self.data_type, self.engine, self.threads),
+            "欠損許容  sample %.3f / site %.3f" % (self.qc.max_sample_missing, self.qc.max_site_missing),
+            "QC        minMAF %.3f / sexChr除外 %s" % (
+                self.qc.min_maf,
+                "yes" if self.qc.exclude_sex_chr else "no",
+            ),
         ]
         if sample_stage:
             lines.extend(
@@ -1482,6 +1489,7 @@ def run_cohort_pca(config, samples: Iterable[str], *, force: bool = False) -> Di
         engine,
         len(sample_list),
         threads=getattr(config.args, "threads", 1),
+        qc=qc,
         enabled=not getattr(config.args, "no_progress", False),
     )
     logger.info(
