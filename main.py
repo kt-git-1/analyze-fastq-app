@@ -18,7 +18,6 @@ from config import (
     PipelineConfig,
     parse_args,
     setup_logging,
-    cleanup_intermediate_file,
 )
 from modules.fastq_parser import FastqRun, group_fastqs_by_run, parse_fastq_general, merge_lanes_by_cat
 from modules.bam_parser import group_bams_by_sample
@@ -86,6 +85,9 @@ def _cleanup_completed_fastq_intermediates(
 
     final dedup BAM は後段の cohort/PCA 解析や再開に使えるため残す。
     """
+    deleted_counts = Counter()
+    failures: List[Tuple[Path, str]] = []
+
     for sample_acc in succeeded_samples:
         sample_dir = config.results_dir / sample_acc
 
@@ -93,21 +95,41 @@ def _cleanup_completed_fastq_intermediates(
         if runs_dir.exists():
             try:
                 shutil.rmtree(runs_dir)
-                logger.info("中間ディレクトリを削除しました: %s", runs_dir)
+                deleted_counts["runs_dir"] += 1
+                logger.debug("中間ディレクトリを削除しました: %s", runs_dir)
             except OSError as exc:
-                logger.warning("中間ディレクトリを削除できませんでした: %s (%s)", runs_dir, exc)
+                failures.append((runs_dir, str(exc)))
 
         dedup_dir = sample_dir / "dedup"
         for suffix in ("merged.bam", "marked.bam"):
-            cleanup_intermediate_file(dedup_dir / f"{sample_acc}.{suffix}", logger)
+            bam_path = dedup_dir / f"{sample_acc}.{suffix}"
+            if not bam_path.exists():
+                continue
+            try:
+                bam_path.unlink()
+                deleted_counts["bam_file"] += 1
+                logger.debug("中間BAMを削除しました: %s", bam_path)
+            except OSError as exc:
+                failures.append((bam_path, str(exc)))
 
         temp_sample_dir = config.temp_dir / sample_acc
         if temp_sample_dir.exists():
             try:
                 shutil.rmtree(temp_sample_dir)
-                logger.info("一時ディレクトリを削除しました: %s", temp_sample_dir)
+                deleted_counts["temp_dir"] += 1
+                logger.debug("一時ディレクトリを削除しました: %s", temp_sample_dir)
             except OSError as exc:
-                logger.warning("一時ディレクトリを削除できませんでした: %s (%s)", temp_sample_dir, exc)
+                failures.append((temp_sample_dir, str(exc)))
+
+    logger.info(
+        "中間ファイル削除サマリー: 対象 %d サンプル / runsディレクトリ %d 件 / 一時ディレクトリ %d 件 / 中間BAM %d 件を削除しました。最終 dedup BAM は保持しています。",
+        len(succeeded_samples),
+        deleted_counts["runs_dir"],
+        deleted_counts["temp_dir"],
+        deleted_counts["bam_file"],
+    )
+    for path, error in failures:
+        logger.warning("中間ファイルを削除できませんでした: %s (%s)", path, error)
 
 
 def _parse_number(text: str) -> str:
@@ -1048,7 +1070,7 @@ def main() -> None:
             sys.exit(1)
 
     if not bam_mode and succeeded:
-        logger.info("成功サンプルの中間ファイルをまとめて削除します")
+        logger.info("中間ファイル削除を開始: 対象 %d サンプル。最終 dedup BAM は保持します。", len(succeeded))
         _cleanup_completed_fastq_intermediates(config, succeeded)
 
     # 8. サマリーを出力

@@ -1,53 +1,151 @@
 # analyze-fastq-app
 
-FASTQ の取得、前処理、BWA マッピング、BAM 処理、QC、VCF 出力までをまとめて実行する NGS 解析パイプラインです。ENA project accession、ローカル FASTQ、既存 dedup BAM の 3 種類を入口として使えます。
+FASTQ の取得、前処理、BWA マッピング、BAM 処理、QC、VCF 出力、cohort PCA/MDS までをまとめて実行する NGS 解析パイプラインです。
 
-古 DNA と現代 DNA の両方を想定しており、FASTQ から解析する場合は `--data_type ancient|modern|auto` で AdapterRemoval / BWA 周りの処理を切り替えます。`--data_type` を指定しない場合は `ancient` として実行します。自動判定したい場合は `--data_type auto` を明示してください。
+このリポジトリは、主に馬ゲノム解析を想定した構成になっています。デフォルトの参照ゲノム名や例は `equCab3.nochrUn.fa` ですが、`--reference_genome` を指定すれば別の参照FASTAでも実行できます。
+
+## 最初に読む要点
+
+- 入力は3種類です。
+  - ENA project accession からFASTQを取得して解析する
+  - すでに手元にあるFASTQディレクトリを解析する
+  - すでに作成済みのdedup BAMからQC/VCF/PCAだけを実行する
+- FASTQ解析では、複数runや複数laneに分かれたFASTQをsample単位にまとめ、最終的にsampleごとのdedup BAMとVCFを作ります。
+- `--data_type ancient` では古DNA向けにcollapsed readを考慮した処理を行います。
+- `--data_type modern` では通常のpaired-end/single-end readsとして処理します。
+- `--data_type auto` はPCA直前にfinal dedup BAMのread lengthから ancient / modern を推定します。省略時のデフォルトではありません。
+- PCA/MDSは `--run-pca --pca-sites <共通SNPリスト>` を指定したときだけ実行されます。
+- PCAで使うPLINK/EIGENSOFT/Picardの固定パスは [tool_paths.py](tool_paths.py) で管理します。
 
 ## できること
 
-- ENA から FASTQ をダウンロードして解析する
-- HTTPS ダウンロードだけを先に実行し、解析と分けて運用する
-- ローカル FASTQ を sample / run / R1 / R2 / single に自動分類する
-- AdapterRemoval + BWA MEM で sorted BAM を作成する
-- ancient paired-end では collapsed / non-collapsed reads を分けてマッピングし、BAM をマージする
-- BAM に soft clipping、CleanSam、sample 単位 merge、MarkDuplicates、sort、index を行う
-- 既存 dedup BAM から mapDamage / Qualimap / HaplotypeCaller だけを実行する
-- `.done` チェックポイントで完了済みサンプルをスキップし、途中から再開する
-- `--parallel_samples` でサンプル単位に並列実行する
-- `data_type=ancient` では final dedup BAM から pseudo-haploid matrix を作り、cohort PCA/MDS を実行する
-- `data_type=modern` では final dedup BAM から diploid genotype matrix を作り、cohort PCA/MDS を実行する
+- ENAからFASTQをダウンロードして解析する
+- HTTPSダウンロードだけを先に実行し、あとで解析する
+- ローカルFASTQをsample / run / R1 / R2 / singleに自動分類する
+- AdapterRemovalでtrim/collapseし、BWA MEMで参照ゲノムへマッピングする
+- run単位BAMをsample単位にmergeし、MarkDuplicates、sort、indexを行う
+- BAMにsoft clipping、Picard CleanSam、mapDamage、Qualimap、GATK HaplotypeCallerを実行する
+- 既存dedup BAMからmapDamage / Qualimap / HaplotypeCaller / PCAだけを実行する
+- `.done` チェックポイントにより、完了済みsampleをスキップして再開する
+- `--parallel_samples` でsample単位に並列実行する
+- ancient sampleではfinal dedup BAMからpseudo-haploid matrixを作り、cohort PCA/MDSを実行する
+- modern sampleではfinal dedup BAMからdiploid genotype matrixを作り、cohort PCA/MDSを実行する
 
-## Quick Start
+## 実行前の確認
 
-### ENA からダウンロードして解析
+### Python環境
 
-```sh
-python main.py \
-  --project_accession PRJEB19970 \
-  --download-via-https \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
-```
-
-### ローカル FASTQ を解析
+基本のPython環境は `environment.yml` から作成します。
 
 ```sh
-python main.py \
-  --fastq_dir ./my_fastqs \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
+conda env create -f environment.yml
+conda activate analyze-env
 ```
 
-この例では `--data_type` を省略しているため、デフォルトの `ancient` として処理されます。
+`plink`、`convertf`、`smartpca` はこのconda環境に入っている必要はありません。このプロジェクトでは固定パスから直接呼び出します。
 
-### PCA/MDS まで実行
+### 外部ツール
 
-PCA/MDS で `--pca-engine eigensoft` を使う場合、外部ツールは次の固定パスから実行します。conda activate は不要です。
+起動時に以下を検証します。
+
+- `bwa`
+- `samtools`
+- `AdapterRemoval`
+- `java`
+- `gatk`
+- `qualimap`
+- `mapDamage`
+- Picard jar
+- 参照ゲノムFASTA
+- BWA index (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`)
+- PCA実行時のみ PLINK / CONVERTF / smartpca
+
+PCAで使う外部ツールは次の固定パスです。
 
 ```sh
 ls -l /usr/local/bin/plink
 ls -l /usr/bin/convertf
 ls -l /usr/bin/smartpca
+ls -l /usr/local/bin/picard.jar
 ```
+
+このパスは [tool_paths.py](tool_paths.py) で管理しています。別サーバーで場所が違う場合は、次の値を変更してください。
+
+```python
+PLINK_BIN = Path("/usr/local/bin/plink")
+CONVERTF_BIN = Path("/usr/bin/convertf")
+SMARTPCA_BIN = Path("/usr/bin/smartpca")
+PICARD_JAR = Path("/usr/local/bin/picard.jar")
+```
+
+参照ゲノムの `.fai` がない場合は、実行中に `samtools faidx` で自動作成します。GATK用の `.dict` はHaplotypeCallerに必要です。
+
+## まず動かすコマンド
+
+### 1. ローカルFASTQを解析する
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+`--data_type` を省略すると `ancient` として処理されます。modern sampleなら明示的に指定してください。
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type modern
+```
+
+### 2. ENAからダウンロードして解析する
+
+```sh
+python main.py \
+  --project_accession PRJEB19970 \
+  --download-via-https \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+### 3. ダウンロードと解析を分ける
+
+大きいprojectでは、先にダウンロードだけを完了させる運用が安全です。
+
+```sh
+python -m modules.ena_download_https \
+  --project PRJEB19970 \
+  --out ./data/raw_data \
+  --workers 2
+```
+
+ダウンロード後、FASTQディレクトリを入力にして解析します。
+
+```sh
+python main.py \
+  --fastq_dir ./data/raw_data/PRJEB19970 \
+  --base_dir ./data \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+### 4. 既存dedup BAMからQC/VCFだけ実行する
+
+```sh
+python main.py \
+  --bam_dir ./my_dedup_bams \
+  --bam_stage dedup \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient
+```
+
+`--bam_dir` 指定時は、FASTQ判定、AdapterRemoval、BWA、soft clipping、CleanSam、MarkDuplicatesを実行しません。入力BAMはすでに重複除去済み・coordinate sort済みのdedup BAMとして扱います。
+
+### 5. PCA/MDSまで実行する
+
+ancient sample:
 
 ```sh
 python main.py \
@@ -55,10 +153,11 @@ python main.py \
   --reference_genome ./data/reference/equCab3.nochrUn.fa \
   --data_type ancient \
   --run-pca \
-  --pca-sites ./horse_common_sites.vcf
+  --pca-sites ./horse_common_sites.vcf \
+  --pca-engine eigensoft
 ```
 
-modern sample の場合:
+modern sample:
 
 ```sh
 python main.py \
@@ -66,10 +165,11 @@ python main.py \
   --reference_genome ./data/reference/equCab3.nochrUn.fa \
   --data_type modern \
   --run-pca \
-  --pca-sites ./horse_common_sites.vcf
+  --pca-sites ./horse_common_sites.vcf \
+  --pca-engine eigensoft
 ```
 
-ancient / modern が事前に不明な場合:
+ancient / modernが事前に不明な場合:
 
 ```sh
 python main.py \
@@ -77,78 +177,97 @@ python main.py \
   --reference_genome ./data/reference/equCab3.nochrUn.fa \
   --data_type auto \
   --run-pca \
-  --pca-sites ./horse_common_sites.vcf
+  --pca-sites ./horse_common_sites.vcf \
+  --pca-engine eigensoft
 ```
 
-`auto` は「指定しない場合のデフォルト」ではありません。`auto` を使う場合だけ、final dedup BAM の mapped read length 中央値に基づいてPCA入力を `ancient` / `modern` に自動分岐します。
+`auto` は、final dedup BAMのmapped read length中央値を使ってPCA入力を `ancient` / `modern` に分岐します。cohort中央値が100bp以下なら `ancient`、100bp超なら `modern` として扱います。推定結果は `results/<project>/cohort/auto_data_type_summary.tsv` に出力されます。
 
-`--fastq_dir` には、解析したい FASTQ 群をまとめて含むフォルダを指定します。
+## 入力モードの選び方
 
-- 複数の sequencing run に同じ sample がまたがる場合は、run フォルダ群の親フォルダを指定します。
-  例: `/home/rc/Project_Horse/raw_data/ancient`
-- 1つの sequencing run だけを解析する場合は、その run フォルダを指定できます。
-  例: `/home/rc/Project_Horse/raw_data/ancient/210416_A01210_0064_BHWKFYDMXX`
-- sample ごとに整理済みの場合は、sample フォルダ群の親フォルダを指定できます。
-- 同じ sample が複数runにまたがる場合、runフォルダ単位で複数回実行する運用は非推奨です。sample単位で全runを統合できないため、深度や重複除去が分断されます。
-
-### 既存 dedup BAM から QC / VCF だけ実行
-
-```sh
-python main.py \
-  --bam_dir ./my_dedup_bams \
-  --bam_stage dedup \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
-```
-
-`--bam_dir` 指定時は FASTQ 判定、AdapterRemoval、BWA、soft clipping、CleanSam、MarkDuplicates を実行しません。入力 BAM は既に重複除去・sort 済みの dedup BAM として扱います。
-
-### ダウンロードと解析を分ける
-
-```sh
-# Step 1: HTTPS でダウンロード
-python -m modules.ena_download_https \
-  --project PRJEB19970 \
-  --out ./data/raw_data \
-  --workers 2
-
-# Step 2: ダウンロード済み FASTQ を解析
-python main.py \
-  --fastq_dir ./data/raw_data/PRJEB19970 \
-  --base_dir ./data \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
-```
-
-### サンプル並列実行
-
-```sh
-python main.py \
-  --fastq_dir ./my_fastqs \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa \
-  --parallel_samples 3 \
-  --threads 8
-```
-
-各サンプルが `--threads` 本のスレッドを使います。合計負荷はおおむね `parallel_samples × threads` です。
-
-## 入力モード
-
-| モード | 主な引数 | 実行される処理 |
+| やりたいこと | 使う引数 | 備考 |
 | ---- | ---- | ---- |
-| ENA から解析 | `--project_accession`, `--download-via-https` | HTTPS ダウンロード → FASTQ 解析 |
-| ENA API + HTTP/FTP ダウンロード | `--project_accession` | ENA メタデータ取得 → FASTQ ダウンロード → FASTQ 解析 |
-| ローカル FASTQ | `--fastq_dir` | FASTQ 自動判定 → 前処理 → BAM → QC → VCF |
-| 既存 dedup BAM | `--bam_dir --bam_stage dedup` | BAM index 確認 → mapDamage → Qualimap → HaplotypeCaller |
+| ENA accessionから直接解析したい | `--project_accession`, `--download-via-https` | HTTPSで取得してから解析 |
+| ENA APIの通常ダウンロード経路を使いたい | `--project_accession` | `--download-via-https` なし |
+| 手元のFASTQを解析したい | `--fastq_dir` | sample/run/readを自動判定 |
+| 既存dedup BAMから後段だけ実行したい | `--bam_dir --bam_stage dedup` | mapDamage / Qualimap / HaplotypeCaller / PCA |
 
 `--bam_dir` は `--fastq_dir` および `--download-via-https` と同時指定できません。
 
-## FASTQ 解析ワークフロー
+## FASTQディレクトリの指定
+
+`--fastq_dir` には、解析したいFASTQ群をまとめて含むフォルダを指定します。
+
+良い例:
+
+```text
+my_fastqs/
+  SampleA/
+    Run1/
+      SampleA_L001_R1_001.fastq.gz
+      SampleA_L001_R2_001.fastq.gz
+    Run2/
+      SampleA_L002_R1_001.fastq.gz
+      SampleA_L002_R2_001.fastq.gz
+  SampleB/
+    Run1/
+      SampleB_L001_R1_001.fastq.gz
+      SampleB_L001_R2_001.fastq.gz
+```
+
+runフォルダがsampleフォルダより上にある構成にも対応します。
+
+```text
+ancient/
+  210416_A01210_0064_BHWKFYDMXX/
+    PE-AncientHorses-01_S1_L001_R1_001.fastq.gz
+    PE-AncientHorses-01_S1_L001_R2_001.fastq.gz
+  210419_A00581_0145_AHWKL3DMXX/
+    PE-AncientHorses-01_S1_L002_R1_001.fastq.gz
+    PE-AncientHorses-01_S1_L002_R2_001.fastq.gz
+```
+
+この例では `PE-AncientHorses-01_S1` が同じsampleとしてまとめられ、2つのrunとして解析されます。
+
+避けるべき運用:
+
+- 同じsampleのrunを別々に `main.py` で実行する
+- 広すぎる親ディレクトリを指定して、別projectのFASTQまで混ぜる
+- R1だけ、またはR2だけの不完全なpaired-endセットを入力する
+
+同じsampleの複数runを別々に解析すると、sample単位のmergeやMarkDuplicatesが正しく行われず、深度、重複率、VCF、PCAの入力が分断されます。
+
+## FASTQ判定ルール
+
+対象拡張子:
+
+- `.fastq`
+- `.fastq.gz`
+- `.fq`
+- `.fq.gz`
+
+対応している主な命名規則:
+
+| 形式 | 例 | 判定 |
+| ---- | ---- | ---- |
+| Illumina | `SAMPLE_A_L001_R1_001.fastq.gz` | sample=`SAMPLE_A`, run=`SAMPLE_A_L001`, read=`R1` |
+| Filgen | `Horse01_L1_1.fq.gz` | sample=`Horse01`, run=`Horse01_L1`, read=`R1` |
+| R1/R2 | `sampleB_R1.fastq.gz`, `sampleB-R2.fastq.gz` | paired-end |
+| `_1/_2` | `sampleC_1.fq.gz`, `sampleC_2.fq.gz` | paired-end |
+| その他 | `ERR123456.fastq.gz` | single-end。ファイル名をrunとして扱う |
+
+sample名は、ファイル名とディレクトリ構造から推定します。sampleごとのサブディレクトリがある場合は、その最上位ディレクトリ名を優先します。run IDは、直上のrunディレクトリ名、ファイル名のlane情報、single-endのファイル名などから作ります。
+
+同じsample/runにpaired-endとsingle-endが混在する場合はpaired-endを優先します。片側だけのpaired-end FASTQはwarningを出して除外します。R1/R2の本数が一致しない場合は、対応できたペアだけを解析します。
+
+## FASTQ解析ワークフロー
 
 ```text
 FASTQ
   ↓
 sample / run / R1 / R2 / single を判定
   ↓
-run 単位の処理
+run単位の処理
   AdapterRemoval
   ↓
   BWA MEM + samtools sort
@@ -157,7 +276,7 @@ run 単位の処理
   ↓
   Picard CleanSam
   ↓
-sample 単位の処理
+sample単位の処理
   samtools merge
   ↓
   Picard MarkDuplicates
@@ -173,81 +292,30 @@ sample 単位の処理
 .done 作成
 ```
 
-FASTQ から作成された run 単位の BAM や merge/marking 中間 BAM は、全 sample の解析が終了した後に成功 sample 分だけまとめて削除されます。最終 dedup BAM と index は、再開や後段の cohort/PCA 解析に使えるよう残します。
+FASTQから作成されたrun単位BAMやmerge/marking中間BAMは、全sampleの解析が終わってから成功sample分だけまとめて削除します。最終dedup BAMとindexは、再開、QC確認、PCAに使うため保持します。
 
-### ancient と modern の違い
+## ancient / modern / auto の違い
 
-| `--data_type` | AdapterRemoval | マッピング |
+| `--data_type` | FASTQ前処理 | PCA入力 |
 | ---- | ---- | ---- |
-| `ancient` | `--minquality 20 --minlength 30 --collapse` | collapsed reads を single-end、non-collapsed reads を paired-end としてマッピングし、run 内でマージ |
-| `modern` | `--minquality 25 --minlength 25` | 通常の paired-end / single-end としてマッピング |
-| `auto` | ancient と同じ設定 | ancient 互換でマッピングし、PCA直前にfinal dedup BAMのread lengthから `ancient` / `modern` を推定 |
+| `ancient` | AdapterRemoval `--minquality 20 --minlength 30 --collapse` | final dedup BAMからpseudo-haploid alleleを抽出 |
+| `modern` | AdapterRemoval `--minquality 25 --minlength 25` | final dedup BAMからref/alt read countを取り、0/1/2 dosageに変換 |
+| `auto` | ancient互換でマッピング | PCA直前にread length中央値でancient/modernを推定 |
 
-## FASTQ 判定ルール
+古DNAでは低depthが多いため、HaplotypeCallerのsample別diploid VCFをそのままPCA入力にはしません。PCAでは、指定した共通SNPリスト上でfinal dedup BAMからpseudo-haploid alleleを抽出してcohort matrixを作ります。
 
-`--fastq_dir` 配下を再帰探索し、次の拡張子を対象にします。
+modernでは、指定したSNP座位のref/alt read countからdosageを作ります。alt fractionが0.2以下なら0、0.8以上なら2、それ以外は1として扱います。
 
-- `.fastq`
-- `.fastq.gz`
-- `.fq`
-- `.fq.gz`
+## BAM入力モード
 
-対応している主な命名規則:
-
-| 形式 | 例 | 判定 |
-| ---- | ---- | ---- |
-| Illumina | `SAMPLE_A_L001_R1_001.fastq.gz` | sample=`SAMPLE_A`, run=`SAMPLE_A_L001`, read=`R1` |
-| Filgen | `Horse01_L1_1.fq.gz` | sample=`Horse01`, run=`Horse01_L1`, read=`R1` |
-| R1/R2 | `sampleB_R1.fastq.gz`, `sampleB-R2.fastq.gz` | paired-end |
-| `_1/_2` | `sampleC_1.fq.gz`, `sampleC_2.fq.gz` | paired-end |
-| その他 | `ERR123456.fastq.gz` | single-end。ファイル名を run として扱う |
-
-sample 名は次の優先順位で決まります。
-
-1. `run/sample` 逆順構成では、ファイル名から推定した sample 名
-2. FASTQ が sample サブディレクトリ配下にある場合は、`--fastq_dir` 直下の最上位ディレクトリ名
-3. FASTQ 拡張子を除いたファイル名
-
-run ID は次の優先順位で決まります。
-
-1. `run/sample` 逆順構成では、`runフォルダ名_lane`
-2. `sample/run/file.fastq.gz` のように 3 階層以上ある場合は、FASTQ の直上ディレクトリ名
-3. ファイル名から推定した lane 付き run 名
-4. single-end FASTQ では FASTQ 拡張子を除いたファイル名
-5. 上記が使えない場合は sample 名
-
-複数runを含む親フォルダを指定した場合、次のような `run/sample` 逆順構成にも対応します。
-
-```text
-ancient/
-  210416_A01210_0064_BHWKFYDMXX/
-    PE-AncientHorses-01_S1_L001_R1_001.fastq.gz
-    PE-AncientHorses-01_S1_L001_R2_001.fastq.gz
-  210419_A00581_0145_AHWKL3DMXX/
-    PE-AncientHorses-01_S1_L002_R1_001.fastq.gz
-    PE-AncientHorses-01_S1_L002_R2_001.fastq.gz
-```
-
-この例では `PE-AncientHorses-01_S1` が同じ sample として集約され、run ID は `210416_A01210_0064_BHWKFYDMXX_L001` と `210419_A00581_0145_AHWKL3DMXX_L002` になります。
-
-同じ sample 直下に複数の single-end FASTQ がある場合、すべて同じ生物学的 sample の別 run として解析します。各FASTQは独立に AdapterRemoval / BWA / soft clipping / CleanSam を通り、sample 単位で merge + MarkDuplicates されます。
-
-ファイル名に `SCY1.1` や `SCY1.2` のような library らしい文字列が含まれる場合は、read group の `LB` にその値を設定します。検出できない場合は `--rg_library` の値を使います。
-
-同じ sample/run に paired-end と single-end が混在する場合は paired-end を優先し、single-end は無視します。
-
-片側だけの paired-end FASTQ は warning を出して除外します。R1/R2 の本数が一致しない場合は、対応できたペアだけを解析します。
-
-## BAM 入力モード
-
-`--bam_dir` を指定すると、既存 dedup BAM から QC / VCF だけを実行します。v1 では `--bam_stage dedup` のみ対応しています。
+`--bam_dir` を指定すると、既存dedup BAMからQC/VCF/PCAだけを実行します。
 
 ```text
 dedup BAM
   ↓
-sample 名をファイル名から推定
+sample名をファイル名から推定
   ↓
-BAM index 確認 / 必要なら samtools index
+BAM index確認 / 必要なら samtools index
   ↓
 mapDamage
   ↓
@@ -258,87 +326,92 @@ GATK HaplotypeCaller
 .done 作成
 ```
 
-### BAM の検出
-
-デフォルトでは `--bam_dir` 配下の `*.bam` を再帰探索します。対象を絞る場合は `--bam_pattern` を指定します。
+デフォルトでは `--bam_dir` 配下の `*.bam` を再帰探索します。対象を絞る場合は `--bam_pattern` を使います。
 
 ```sh
 python main.py \
   --bam_dir ./my_dedup_bams \
   --bam_pattern "*.dedup.sorted.bam" \
-  --reference_genome ./data/reference/equCab3.nochrUn.fa
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type modern
 ```
 
-### sample 名の推定
+sample名はBAMファイル名から推定します。
 
-sample 名は BAM ファイル名から推定します。次の suffix を取り除いた残りが sample 名です。
-
-| BAM ファイル名 | sample 名 |
+| BAMファイル名 | sample名 |
 | ---- | ---- |
 | `SAMPLE_A.dedup.sorted.bam` | `SAMPLE_A` |
 | `SAMPLE_B.sorted.bam` | `SAMPLE_B` |
 | `SAMPLE_C.dedup.bam` | `SAMPLE_C` |
 | `SAMPLE_D.bam` | `SAMPLE_D` |
 
-同じ sample 名に解釈される BAM が複数見つかった場合はエラー終了します。
+同じsample名に解釈されるBAMが複数見つかった場合はエラー終了します。`<input>.bam.bai` または `<input>.bai` があれば既存indexを使います。どちらもなければ `samtools index <input>.bam` を実行します。入力BAMと既存indexは削除しません。
 
-### BAM index
+## PCA/MDS
 
-`<input>.bam.bai` または `<input>.bai` が存在すれば既存 index を使います。どちらも存在しない場合は `samtools index <input>.bam` を実行します。
+PCA/MDSを実行するには、少なくとも2つ以上の成功sampleと、共通SNPリストが必要です。
 
-入力 BAM と既存 index は削除されません。
-
-## 出力
-
-主な出力先:
-
-```text
-data/
-  raw_data/<project>/                 # ダウンロード FASTQ
-  results/<project>/sample_qc_summary.tsv
-  results/<project>/cohort/
-    pca_sites.tsv
-    pseudohaploid_raw_calls.tsv
-    pseudohaploid_matrix.tsv
-    pseudohaploid_matrix.filtered.tsv
-    pca_qc_summary.tsv
-    eigenstrat/
-      cohort.geno
-      cohort.snp
-      cohort.ind
-    plink/
-      cohort.tped
-      cohort.tfam
-    pca/
-      pca_scores.tsv
-      pca_variance.tsv
-      mds.tsv
-  results/<project>/<sample>/
-    dedup/
-      <sample>.dedup.sorted.bam
-      <sample>.dedup.sorted.bam.bai
-    mapdamage/
-    qualimap/
-    vcf_files/
-      <sample>.vcf
-    .done
-  logs/
-    pipeline_<project>.log
-  temp/
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./horse_common_sites.vcf
 ```
 
-VCF は sample ごとに出力されます。複数の run / lane / FASTQ が同じ sample に属する場合、それらは sample 単位で統合された dedup BAM から `<sample>.vcf` として1つ出力されます。
+`--pca-sites` はVCFまたはBED-like textを指定できます。VCFではbiallelic SNPだけを使用し、multi-allelic siteやindelは除外されます。
 
-`--data_type ancient` の HaplotypeCaller VCF は raw diploid 候補確認用です。低深度 ancient DNA の PCA/MDS では、この単一 sample VCF を直接入力にせず、保持された final dedup BAM から pseudo-haploid な cohort matrix を作成してください。
+### EIGENSOFTを使う通常経路
 
-`sample_qc_summary.tsv` には、成功 sample ごとの final dedup BAM、Qualimap主要指標、VCF件数、ancient PCA向けの注意メモが集約されます。
+デフォルトは `--pca-engine eigensoft` です。
 
-`--run-pca --pca-sites <sites.vcf>` を指定すると、全 sample 完了後に cohort PCA/MDS stage を実行します。`--data_type ancient` では保持された final dedup BAM から指定SNP座位の allele を抽出して pseudo-haploid matrix を作成します。`--data_type modern` では保持された final dedup BAM から指定SNP座位の ref/alt read count を取り、0/1/2 の diploid genotype matrix を作成します。`--data_type auto` では final dedup BAM のmapped read length中央値を集計し、cohort中央値が100bp以下なら `ancient`、100bp超なら `modern` としてPCA入力を自動分岐します。推定結果は `cohort/auto_data_type_summary.tsv` と `pca_qc_summary.tsv` に出力されます。その後、PLINK QC / LD pruning、CONVERTF、smartpca の順に実行します。途中成果物が存在する場合は再利用され、`--force` 指定時のみ作り直します。外部ツールを使わず従来のPython内蔵PCA/MDSで確認したい場合は `--pca-engine python` を指定します。
+```text
+final dedup BAM
+  ↓
+ancient: pseudo-haploid raw calls
+modern: diploid genotype calls
+  ↓
+cohort matrix
+  ↓
+missingness / MAF / sex chromosome filter
+  ↓
+PLINK text
+  ↓
+PLINK binary
+  ↓
+PLINK QC
+  ↓
+LD pruning
+  ↓
+CONVERTF
+  ↓
+EIGENSTRAT
+  ↓
+smartpca
+  ↓
+pca_scores.tsv / pca_variance.tsv / mds.tsv
+```
 
-`--pca-engine eigensoft` は `/usr/local/bin/plink`、`/usr/bin/convertf`、`/usr/bin/smartpca` を直接呼び出します。これらが存在すれば、`conda activate ancient-pca` は不要です。
-固定パスは `tool_paths.py` で管理しています。別サーバーでパスが違う場合は、このファイルの `PLINK_BIN`、`CONVERTF_BIN`、`SMARTPCA_BIN`、`PICARD_JAR` を変更してください。
+外部ツールは [tool_paths.py](tool_paths.py) の固定パスを直接呼びます。PATHやconda activateには依存しません。
 
-資料の手順に沿ってQC閾値を指定する例:
+### Python fallback
+
+外部ツールなしで処理確認だけしたい場合は、内蔵のNumPyベースPCA/MDSを使えます。
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --data_type ancient \
+  --run-pca \
+  --pca-sites ./horse_common_sites.vcf \
+  --pca-engine python
+```
+
+これはPLINK/EIGENSOFTを使わない簡易経路です。最終解析では `eigensoft` を推奨します。
+
+### PCA QCパラメータ
 
 ```sh
 python main.py \
@@ -360,19 +433,94 @@ python main.py \
   --pca-ld-r2 0.2
 ```
 
-`<project>` は通常 `--project_accession` です。`--fastq_dir` 指定時は FASTQ ディレクトリ名、`--bam_dir` 指定時は BAM ディレクトリ名が使われます。
+| 引数 | 意味 |
+| ---- | ---- |
+| `--pca-min-mapq` | BAMからallele/genotypeを拾うときの最小mapping quality |
+| `--pca-min-baseq` | allele判定に使う最小base quality |
+| `--pca-trim-ends` | read両端から除外する塩基数。古DNAの末端損傷対策 |
+| `--pca-max-sample-missing` | sampleごとの許容欠損率 |
+| `--pca-max-site-missing` | SNP siteごとの許容欠損率 |
+| `--pca-min-maf` | 最小minor allele frequency |
+| `--pca-exclude-sex-chr` | X/Y/W/Zや23/24などの性染色体siteを除外 |
+| `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size |
+| `--pca-ld-step` | PLINK `--indep-pairwise` のstep size |
+| `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 |
+
+## 出力
+
+デフォルトでは `--base_dir ./data` の下に出力します。`--fastq_dir` 指定時はFASTQディレクトリ名、`--bam_dir` 指定時はBAMディレクトリ名がproject名として使われます。ENA入力では通常 `--project_accession` がproject名です。
+
+主な出力:
+
+```text
+data/
+  raw_data/<project>/                 # ダウンロードFASTQ
+  results/<project>/
+    sample_qc_summary.tsv
+    cohort/
+      pca_sites.tsv
+      auto_data_type_summary.tsv       # data_type=auto の場合
+      pseudohaploid_raw_calls.tsv      # ancient PCA
+      pseudohaploid_matrix.tsv
+      pseudohaploid_matrix.filtered.tsv
+      modern_genotype_calls.tsv        # modern PCA
+      modern_genotype_matrix.tsv
+      modern_genotype_matrix.filtered.tsv
+      pca_qc_summary.tsv
+      eigenstrat/
+        cohort.geno
+        cohort.snp
+        cohort.ind
+      plink/
+        cohort.tped
+        cohort.tfam
+        cohort.bed
+        cohort.bim
+        cohort.fam
+        cohort.qc.*
+        cohort.prune.prune.in
+        cohort.pruned.*
+      pca/
+        cohort.evec
+        cohort.eval
+        pca_scores.tsv
+        pca_variance.tsv
+        mds.tsv
+    <sample>/
+      dedup/
+        <sample>.dedup.sorted.bam
+        <sample>.dedup.sorted.bam.bai
+      mapdamage/
+      qualimap/
+      vcf_files/
+        <sample>.vcf
+      .done
+  logs/
+    pipeline_<project>.log
+  temp/
+```
+
+重要なファイル:
+
+| ファイル | 内容 |
+| ---- | ---- |
+| `sample_qc_summary.tsv` | 成功sampleごとのdedup BAM、Qualimap主要指標、VCF件数 |
+| `<sample>.dedup.sorted.bam` | 後段解析に使う最終BAM |
+| `<sample>.vcf` | sampleごとのHaplotypeCaller出力 |
+| `pca_qc_summary.tsv` | PCA入力数、残ったsample/site数、QC条件、data_type |
+| `pca_scores.tsv` | PCA座標。散布図作成に使う |
+| `pca_variance.tsv` | 各PCの固有値と説明分散 |
+| `mds.tsv` | MDS座標 |
 
 ## チェックポイントと再開
 
-各 sample の解析が成功すると、`data/results/<project>/<sample>/.done` が作成されます。再実行時は `.done` がある sample をスキップします。
+sample解析が成功すると、`results/<project>/<sample>/.done` が作られます。再実行時は `.done` があるsampleをスキップします。
 
-未完了 sample は、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は BWA mapping / Soft clipping / CleanSam / MarkDuplicates を再実行せず、QC / HaplotypeCaller 側へ進みます。`mapdamage/`、`qualimap/`、`vcf_files/<sample>.vcf` の既存出力がある場合も再利用します。
+未完了sampleは、既存の中間成果物があればそこから再開します。たとえば `dedup/<sample>.dedup.sorted.bam` が残っている場合は、BWA mapping / soft clipping / CleanSam / MarkDuplicatesを再実行せず、QC / HaplotypeCaller側へ進みます。
 
-PCA stage も途中成果物を再利用します。`pca_sites.tsv`、raw calls、matrix、filtered matrix、PLINK text/binary/QC/LD pruning、EIGENSTRAT、smartpca、`pca_scores.tsv`、`pca_variance.tsv`、`mds.tsv` が既に存在する場合は、`--force` を付けない限り既存出力を使って次の未完了ステップから再開します。
+PCA stageも途中成果物を再利用します。`pca_sites.tsv`、raw calls、matrix、filtered matrix、PLINK text/binary/QC/LD pruning、EIGENSTRAT、smartpca、`pca_scores.tsv`、`pca_variance.tsv`、`mds.tsv` が既に存在する場合は、`--force` を付けない限り既存出力を使います。
 
-FASTQ 解析では、run 単位の BAM や一時ファイルは sample ごとに即時削除せず、全 sample の処理が終わってから成功 sample 分だけまとめて削除します。失敗 sample の中間ファイルは原因調査と再開のため残します。最終 dedup BAM と index は後段解析用に保持します。
-
-全 sample を強制的に再実行する場合:
+すべてやり直す場合:
 
 ```sh
 python main.py \
@@ -381,7 +529,17 @@ python main.py \
   --force
 ```
 
-BAM 入力モードでも同じ仕組みで `.done` を使います。
+## サンプル並列実行
+
+```sh
+python main.py \
+  --fastq_dir ./my_fastqs \
+  --reference_genome ./data/reference/equCab3.nochrUn.fa \
+  --parallel_samples 3 \
+  --threads 8
+```
+
+各sampleが `--threads` 本のスレッドを使います。合計負荷はおおむね `parallel_samples × threads` です。上の例では最大24スレッド相当の負荷になります。
 
 ## 実行オプション
 
@@ -389,64 +547,36 @@ BAM 入力モードでも同じ仕組みで `.done` を使います。
 | ---- | ---- | ---- |
 | `--project_accession` | ENA project accession | `PRJEB19970` |
 | `--base_dir` | `raw_data`, `results`, `logs`, `temp` を置くベースディレクトリ | `./data` |
-| `--reference_genome` | 参照ゲノム FASTA | `./data/reference/equCab3.nochrUn.fa` |
-| `--fastq_dir` | ローカル FASTQ ディレクトリ | `None` |
-| `--bam_dir` | 既存 dedup BAM ディレクトリ | `None` |
-| `--bam_stage` | 入力 BAM の処理段階。v1 では `dedup` のみ | `dedup` |
-| `--bam_pattern` | `--bam_dir` 配下で検出する BAM の glob パターン | `*.bam` |
-| `--download-via-https` | HTTPS ダウンロード後に解析する | `False` |
-| `--download_protocol` | ENA 通常ダウンロードで使うプロトコル (`ftp` / `http`) | `http` |
+| `--reference_genome` | 参照ゲノムFASTA | `./data/reference/equCab3.nochrUn.fa` |
+| `--fastq_dir` | ローカルFASTQディレクトリ | `None` |
+| `--bam_dir` | 既存dedup BAMディレクトリ | `None` |
+| `--bam_stage` | 入力BAMの処理段階。v1では `dedup` のみ | `dedup` |
+| `--bam_pattern` | `--bam_dir` 配下で検出するBAMのglob pattern | `*.bam` |
+| `--download-via-https` | HTTPS downloaderで取得してから解析する | `False` |
+| `--download_protocol` | ENA通常ダウンロードで使うプロトコル (`ftp` / `http`) | `http` |
 | `--workers` | ダウンロード並列数 | `4` |
 | `--max_retries` | ダウンロード失敗時の再試行回数 | `3` |
-| `--no-progress` | 端末上の進捗バー表示を無効化し、通常ログのみ出力する | `False` |
-| `--data_type` | FASTQ 解析時のデータ種別 (`ancient` / `modern` / `auto`)。省略時は `ancient`。自動判定する場合は `auto` を明示指定する | `ancient` |
+| `--no-progress` | 端末上の進捗バーを無効化する | `False` |
+| `--data_type` | FASTQ解析時のデータ種別 (`ancient` / `modern` / `auto`) | `ancient` |
 | `--threads` | 解析ツールに渡すスレッド数 | `20` |
-| `--parallel_samples` | 同時に解析する sample 数 | `1` |
-| `--run-pca` | 全 sample 完了後に ancient DNA 向け cohort PCA/MDS stage を実行する | `False` |
-| `--pca-sites` | PCA/MDSで比較する共通SNPリスト (`VCF` または BED-like text) | `None` |
+| `--parallel_samples` | 同時に解析するsample数 | `1` |
+| `--run-pca` | 全sample完了後にcohort PCA/MDS stageを実行する | `False` |
+| `--pca-sites` | PCA/MDSで比較する共通SNPリスト | `None` |
 | `--pca-engine` | PCA実行エンジン (`eigensoft` / `python`) | `eigensoft` |
-| `--pca-min-mapq` | pseudo-haploid抽出で使う最小mapping quality | `30` |
-| `--pca-min-baseq` | pseudo-haploid抽出で使う最小base quality | `30` |
+| `--pca-min-mapq` | PCA入力抽出時の最小mapping quality | `30` |
+| `--pca-min-baseq` | PCA入力抽出時の最小base quality | `30` |
 | `--pca-trim-ends` | read両端から除外する塩基数 | `2` |
-| `--pca-max-sample-missing` | PCA matrixで許容するsample欠損率の上限 | `0.9` |
-| `--pca-max-site-missing` | PCA matrixで許容するSNP欠損率の上限 | `0.9` |
-| `--pca-min-maf` | PCA matrix / PLINK QCで使う最小minor allele frequency | `0.0` |
+| `--pca-max-sample-missing` | sample欠損率の上限 | `0.9` |
+| `--pca-max-site-missing` | SNP欠損率の上限 | `0.9` |
+| `--pca-min-maf` | 最小minor allele frequency | `0.0` |
 | `--pca-exclude-sex-chr` | 性染色体SNPをPCA matrixから除外する | `False` |
 | `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size | `50` |
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size | `5` |
-| `--pca-ld-r2` | PLINK `--indep-pairwise` のr^2閾値 | `0.2` |
-| `--java_mem` | Picard など Java ツール用メモリ | `10g` |
-| `--rg_library` | BWA read group の library (`LB`) | `unknown` |
-| `--rg_center` | BWA read group の center (`CN`) | `unknown` |
-| `--force` | `.done` を無視して再実行する | `False` |
-
-## セットアップ
-
-### Python / conda
-
-```sh
-conda env create -f environment.yml
-conda activate analyze-env
-```
-
-### 外部ツール
-
-パイプライン起動時に次のツールとファイルを検証します。
-
-- `bwa`
-- `samtools`
-- `AdapterRemoval`
-- `java`
-- `gatk`
-- `qualimap`
-- `mapDamage`
-- Picard jar
-- 参照ゲノム FASTA
-- BWA index (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`)
-
-参照ゲノムの `.fai` がない場合は `samtools faidx` で自動作成します。
-
-注意: BAM 入力モードでも、現状の環境検証は FASTQ 解析用ツールを含めて確認します。
+| `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 | `0.2` |
+| `--java_mem` | PicardなどJavaツール用メモリ | `10g` |
+| `--rg_library` | BWA read groupのlibrary (`LB`) | `unknown` |
+| `--rg_center` | BWA read groupのcenter (`CN`) | `unknown` |
+| `--force` | `.done` と既存PCA成果物を無視して再実行する | `False` |
 
 ## 進捗表示
 
@@ -454,67 +584,90 @@ conda activate analyze-env
 
 表示される主な情報:
 
-- ダウンロード中: 全体の完了ファイル数、各 FASTQ の転送量、速度、MD5 スキップ/再試行ログ
-- 解析中: 全体の完了 sample 数、各 sample の現在ステップ、step 数、Soft clipping の read 数
-- 終了時: 成功 sample 数、失敗 sample と失敗ステップ
+- ダウンロード中: 全体の完了ファイル数、各FASTQの転送量、速度、MD5スキップ/再試行ログ
+- 解析中: 全体の完了sample数、各sampleの現在ステップ、step数、soft clippingのread数
+- 終了時: 成功sample数、失敗sampleと失敗ステップ
 
-CI やログファイルだけを確認したい環境では、`--no-progress` を付けると進捗バーを無効化できます。
+CIやログファイルだけを確認したい場合は、`--no-progress` を付けてください。
 
 ## ディレクトリ構成
 
 ```text
 analyze-fastq-app/
-├── config.py
-├── environment.yml
-├── main.py
-├── modules/
-│   ├── analyzers.py
-│   ├── bam_parser.py
-│   ├── bam_processor.py
-│   ├── bwa_mapper.py
-│   ├── ena_downloader.py
-│   ├── ena_download_https.py
-│   ├── fastq_parser.py
-│   ├── softclipper.py
-│   └── __init__.py
-└── README.md
+  config.py
+  environment.yml
+  main.py
+  tool_paths.py
+  modules/
+    analyzers.py
+    bam_parser.py
+    bam_processor.py
+    bwa_mapper.py
+    cohort_pca.py
+    ena_downloader.py
+    ena_download_https.py
+    fastq_parser.py
+    softclipper.py
+  tests/
+  README.md
 ```
 
 ## モジュール概要
 
-- `main.py`: 入力モードの切り替え、sample 単位の逐次/並列実行、完了サマリー出力
-- `config.py`: CLI 引数、ディレクトリ設定、ログ設定、環境検証、中間ファイル削除
-- `modules/fastq_parser.py`: FASTQ の再帰探索、sample / run / read 分類
-- `modules/bam_parser.py`: 既存 BAM の再帰探索、sample 名推定、重複 sample 検出
-- `modules/ena_downloader.py`: ENA Portal API 取得、FTP/HTTP ダウンロード、MD5 検証
-- `modules/ena_download_https.py`: HTTPS ダウンロード専用 CLI、レジューム、`.done` スキップ
-- `modules/bwa_mapper.py`: AdapterRemoval、BWA MEM、samtools sort、ancient paired-end の collapsed/non-collapsed merge
-- `modules/softclipper.py`: BAM read の先頭 5bp soft clipping
-- `modules/bam_processor.py`: CleanSam、sample 単位 merge、MarkDuplicates、sort、index
+- `main.py`: 入力モードの切り替え、sample単位の実行、完了サマリー、PCA stage起動
+- `config.py`: CLI引数、ディレクトリ設定、ログ設定、環境検証、中間ファイル削除
+- `tool_paths.py`: PLINK、CONVERTF、smartpca、Picard jarの固定パス
+- `modules/fastq_parser.py`: FASTQの再帰探索、sample/run/read分類
+- `modules/bam_parser.py`: 既存BAMの再帰探索、sample名推定、重複sample検出
+- `modules/ena_downloader.py`: ENA Portal API取得、FTP/HTTPダウンロード、MD5検証
+- `modules/ena_download_https.py`: HTTPSダウンロード専用CLI、レジューム、`.done` スキップ
+- `modules/bwa_mapper.py`: AdapterRemoval、BWA MEM、samtools sort、ancient paired-endのcollapsed/non-collapsed merge
+- `modules/softclipper.py`: BAM readの先頭5bp soft clipping
+- `modules/bam_processor.py`: Picard CleanSam、sample単位merge、MarkDuplicates、sort、index
 - `modules/analyzers.py`: mapDamage、Qualimap、GATK HaplotypeCaller
+- `modules/cohort_pca.py`: ancient/modern/autoのcohort PCA/MDS、PLINK/EIGENSOFT連携
 
 ## トラブルシューティング
 
 ### 起動直後に止まる
 
-環境検証で不足ツールや不足ファイルが見つかっています。ログに表示されたツール、Picard jar、参照ゲノム、BWA index を確認してください。
+環境検証で不足ツールや不足ファイルが見つかっています。ログに表示されたツール名、Picard jar、参照ゲノム、BWA indexを確認してください。
 
-### FASTQ が見つからない
+PCA実行時にPLINK/EIGENSOFTが見つからない場合は、[tool_paths.py](tool_paths.py) の固定パスと実際のインストール場所が一致しているか確認してください。
 
-`--fastq_dir` のパスと拡張子を確認してください。対象は `.fastq`, `.fastq.gz`, `.fq`, `.fq.gz` です。
+### FASTQが見つからない
 
-### BAM 入力モードで sample 名が重複する
+`--fastq_dir` のパスと拡張子を確認してください。対象は `.fastq`, `.fastq.gz`, `.fq`, `.fq.gz` です。広すぎる親ディレクトリを指定して別projectが混ざっていないかも確認してください。
+
+### sampleが期待通りにまとまらない
+
+同じsampleの複数runをまとめたい場合は、runフォルダ群の親ディレクトリを `--fastq_dir` に指定してください。runごとに別々に実行すると、sample単位mergeと重複除去が分断されます。
+
+### BAM入力モードでsample名が重複する
 
 たとえば `SAMPLE_A.bam` と `SAMPLE_A.sorted.bam` はどちらも `SAMPLE_A` と解釈されるためエラーになります。`--bam_pattern` で対象を絞るか、片方を別ディレクトリへ移動してください。
 
-### BAM index 作成に失敗する
+### BAM index作成に失敗する
 
-入力 BAM が壊れていないか、coordinate sort 済みか、参照ゲノムと整合しているかを確認してください。必要なら事前に `samtools quickcheck` や `samtools index` で確認してください。
+入力BAMが壊れていないか、coordinate sort済みか、参照ゲノムと整合しているかを確認してください。必要なら事前に次を実行してください。
 
-### 途中で失敗した sample だけ再実行したい
+```sh
+samtools quickcheck input.bam
+samtools index input.bam
+```
 
-同じコマンドを再実行してください。`.done` がある sample はスキップされ、未完了 sample は既存の中間成果物から再開します。すべてやり直す場合は `--force` を指定します。
+### PCAでsample/siteが残らない
 
-### Qualimap で `MaxPermSize` エラーが出る
+`pca_qc_summary.tsv` を確認してください。欠損率、MAF、性染色体除外、LD pruningで落ちている可能性があります。まずは `--pca-max-sample-missing` と `--pca-max-site-missing` を緩める、`--pca-min-maf 0.0` にする、`--pca-exclude-sex-chr` を外す、などを試してください。
 
-Java 9 以降では `-XX:MaxPermSize` が廃止されています。`QualimapAnalyzer` は `JAVA_TOOL_OPTIONS=-XX:+IgnoreUnrecognizedVMOptions` を自動付与します。
+### smartpcaは動いたが解釈できない
+
+PCAは「近い位置に出るサンプルが全体として似ている」ことを可視化する手法です。直接の祖先関係を証明するものではありません。比較集団の選び方、欠損率、サンプル数、projectionの有無で位置が変わります。2 sampleだけのPCAはパイプライン確認には使えますが、生物学的解釈には不十分です。
+
+### 途中で失敗したsampleだけ再実行したい
+
+同じコマンドを再実行してください。`.done` があるsampleはスキップされ、未完了sampleは既存の中間成果物から再開します。すべてやり直す場合は `--force` を指定します。
+
+### Qualimapで `MaxPermSize` エラーが出る
+
+Java 9以降では `-XX:MaxPermSize` が廃止されています。`QualimapAnalyzer` は `JAVA_TOOL_OPTIONS=-XX:+IgnoreUnrecognizedVMOptions` を自動付与します。

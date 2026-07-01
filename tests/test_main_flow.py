@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import main as main_module
@@ -126,7 +127,7 @@ def test_process_sample_reuses_existing_vcf(monkeypatch, make_config):
     assert FakeHaplotypeCaller.calls == []
 
 
-def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config):
+def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config, caplog):
     cfg = make_config()
     sample_dir = cfg.results_dir / "S1"
     runs_file = touch(sample_dir / "runs" / "RUN1" / "bam_files" / "RUN1.sorted.bam")
@@ -136,7 +137,8 @@ def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config
     final_bai = touch(sample_dir / "dedup" / "S1.dedup.sorted.bam.bai")
     temp_file = touch(cfg.temp_dir / "S1" / "RUN1.pair1.truncated")
 
-    main_module._cleanup_completed_fastq_intermediates(cfg, ["S1"])
+    with caplog.at_level(logging.INFO, logger=main_module.logger.name):
+        main_module._cleanup_completed_fastq_intermediates(cfg, ["S1"])
 
     assert not runs_file.exists()
     assert not merged_bam.exists()
@@ -144,6 +146,12 @@ def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config
     assert not temp_file.exists()
     assert final_bam.exists()
     assert final_bai.exists()
+    assert (
+        "中間ファイル削除サマリー: 対象 1 サンプル / runsディレクトリ 1 件 / "
+        "一時ディレクトリ 1 件 / 中間BAM 2 件を削除しました"
+        in caplog.text
+    )
+    assert "最終 dedup BAM は保持" in caplog.text
 
 
 def test_write_sample_qc_summary(make_config):
