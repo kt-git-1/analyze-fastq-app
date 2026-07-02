@@ -14,6 +14,7 @@ def make_config(tmp_path):
             rg_library="lib",
             rg_center="center",
             force=False,
+            skip_vcf=False,
             download_protocol="http",
             max_retries=2,
             bam_pattern="*.bam",

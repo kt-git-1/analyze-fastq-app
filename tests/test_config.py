@@ -104,6 +104,12 @@ def test_parse_args_accepts_pca_transversion_only(monkeypatch):
     assert parse_args().pca_transversion_only is True
 
 
+def test_parse_args_accepts_skip_vcf(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--skip-vcf"])
+
+    assert parse_args().skip_vcf is True
+
+
 def test_parse_args_requires_pca_sites_for_run_pca(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["main.py", "--run-pca"])
 

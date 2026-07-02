@@ -214,6 +214,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="完了済みサンプルのチェックポイント (.done) を無視して全サンプルを再実行する",
     )
+    parser.add_argument(
+        "--skip-vcf",
+        action="store_true",
+        help="sampleごとのGATK HaplotypeCaller VCF出力をスキップする。BAM QCとcohort PCA/MDSだけ実行したい場合に使う",
+    )
     # リードグループ: ライブラリ名
     parser.add_argument(
         "--rg_library",

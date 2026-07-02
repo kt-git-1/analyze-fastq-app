@@ -127,6 +127,17 @@ def test_process_sample_reuses_existing_vcf(monkeypatch, make_config):
     assert FakeHaplotypeCaller.calls == []
 
 
+def test_process_sample_skips_haplotypecaller_when_requested(monkeypatch, make_config):
+    reset_fake_results()
+    patch_pipeline_classes(monkeypatch)
+    cfg = make_config()
+    cfg.args.skip_vcf = True
+
+    assert main_module.process_sample("S1", [FastqRun("S1", "RUN1", [Path("r1")])], cfg) == ("S1", True, "")
+    assert FakeHaplotypeCaller.calls == []
+    assert (cfg.results_dir / "S1" / ".done").exists()
+
+
 def test_cleanup_completed_fastq_intermediates_keeps_final_dedup_bam(make_config, caplog):
     cfg = make_config()
     sample_dir = cfg.results_dir / "S1"
@@ -187,8 +198,22 @@ There is a 7% of reference with a coverageData >= 3X
     text = out.read_text()
     assert "sample\tdata_type\tdone" in text
     assert "S1\tancient\ttrue" in text
-    assert "\t1\t1000\t250\t1.0108\t57.1\t22.37\t7\t53.4" in text
+    assert "\t1\tpresent\t1000\t250\t1.0108\t57.1\t22.37\t7\t53.4" in text
     assert "pseudo-haploid cohort PCA" in text
+
+
+def test_write_sample_qc_summary_marks_vcf_skipped(make_config):
+    cfg = make_config()
+    cfg.args.skip_vcf = True
+    sample_dir = cfg.results_dir / "S1"
+    touch(sample_dir / ".done")
+    touch(sample_dir / "dedup" / "S1.dedup.sorted.bam")
+
+    out = main_module._write_sample_qc_summary(cfg, ["S1"])
+
+    text = out.read_text()
+    assert "vcf_status" in text
+    assert "\tskipped\t" in text
 
 
 def test_process_sample_maps_all_fastq_runs_and_merges_outputs(monkeypatch, make_config):
@@ -241,6 +266,19 @@ def test_process_sample_from_dedup_bam_checks_input_and_runs_analyzers(monkeypat
     monkeypatch.setattr(main_module, "_ensure_bam_index", lambda path: True)
 
     assert main_module.process_sample_from_dedup_bam("S1", bam, cfg) == ("S1", True, "")
+    assert (cfg.results_dir / "S1" / ".done").exists()
+
+
+def test_process_sample_from_dedup_bam_skips_haplotypecaller_when_requested(monkeypatch, make_config, tmp_path):
+    reset_fake_results()
+    patch_pipeline_classes(monkeypatch)
+    cfg = make_config()
+    cfg.args.skip_vcf = True
+    bam = touch(tmp_path / "S1.dedup.sorted.bam")
+    monkeypatch.setattr(main_module, "_ensure_bam_index", lambda path: True)
+
+    assert main_module.process_sample_from_dedup_bam("S1", bam, cfg) == ("S1", True, "")
+    assert FakeHaplotypeCaller.calls == []
     assert (cfg.results_dir / "S1" / ".done").exists()
 
 

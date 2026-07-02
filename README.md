@@ -272,7 +272,8 @@ python main.py \
   --pca-engine eigensoft \
   --pca-max-sample-missing 0.99 \
   --pca-max-site-missing 0.97 \
-  --pca-exclude-sex-chr
+  --pca-exclude-sex-chr \
+  --skip-vcf
 ```
 
 古DNA damageの影響を見たい場合のtransversion-only PCA:
@@ -289,6 +290,7 @@ python main.py \
   --pca-max-sample-missing 0.99 \
   --pca-max-site-missing 0.97 \
   --pca-exclude-sex-chr \
+  --skip-vcf \
   --pca-transversion-only
 ```
 
@@ -585,6 +587,7 @@ python main.py \
 | `--pca-min-maf` | 最小minor allele frequency |
 | `--pca-exclude-sex-chr` | X/Y/W/Zや23/24などの性染色体siteを除外 |
 | `--pca-transversion-only` | transversion SNPのみを残す。古DNA damage由来のC/T・G/A影響を抑える |
+| `--skip-vcf` | sampleごとのHaplotypeCaller VCFを作らない。BAM QCとcohort PCA/MDSだけ実行したい場合に使う |
 | `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size |
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size |
 | `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 |
@@ -665,7 +668,7 @@ data/
 
 | ファイル | 内容 |
 | ---- | ---- |
-| `sample_qc_summary.tsv` | 成功sampleごとのdedup BAM、Qualimap主要指標、VCF件数 |
+| `sample_qc_summary.tsv` | 成功sampleごとのdedup BAM、Qualimap主要指標、VCF件数。`vcf_status` は `present` / `skipped` / `missing` |
 | `<sample>.dedup.sorted.bam` | 後段解析に使う最終BAM |
 | `<sample>.vcf` | sampleごとのHaplotypeCaller出力 |
 | `pca_qc_summary.tsv` | PCA入力数、残ったsample/site数、QC条件、data_type |
@@ -840,6 +843,7 @@ python main.py \
 | `--pca-min-maf` | 最小minor allele frequency | `0.0` |
 | `--pca-exclude-sex-chr` | 性染色体SNPをPCA matrixから除外する | `False` |
 | `--pca-transversion-only` | transversion SNPのみをPCA matrixに残す | `False` |
+| `--skip-vcf` | sampleごとのHaplotypeCaller VCF出力をスキップする | `False` |
 | `--pca-ld-window` | PLINK `--indep-pairwise` のwindow size | `50` |
 | `--pca-ld-step` | PLINK `--indep-pairwise` のstep size | `5` |
 | `--pca-ld-r2` | PLINK `--indep-pairwise` のr2閾値 | `0.2` |

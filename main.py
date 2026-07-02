@@ -196,6 +196,7 @@ def _write_sample_qc_summary(
         "qualimap_report",
         "vcf_file",
         "vcf_variants",
+        "vcf_status",
         "qualimap_total_reads",
         "qualimap_mapped_reads",
         "qualimap_mean_coverage",
@@ -222,6 +223,13 @@ def _write_sample_qc_summary(
             mapdamage_dir = sample_dir / "mapdamage"
             qualimap_report = sample_dir / "qualimap" / "genome_results.txt"
             vcf_file = sample_dir / "vcf_files" / f"{sample_acc}.vcf"
+            vcf_exists = vcf_file.exists()
+            if vcf_exists:
+                vcf_status = "present"
+            elif _should_skip_vcf(config):
+                vcf_status = "skipped"
+            else:
+                vcf_status = "missing"
 
             row = {
                 "sample": sample_acc,
@@ -231,8 +239,9 @@ def _write_sample_qc_summary(
                 "dedup_bam_index": str(dedup_bai) if dedup_bai.exists() else "",
                 "mapdamage_dir": str(mapdamage_dir) if mapdamage_dir.exists() else "",
                 "qualimap_report": str(qualimap_report) if qualimap_report.exists() else "",
-                "vcf_file": str(vcf_file) if vcf_file.exists() else "",
+                "vcf_file": str(vcf_file) if vcf_exists else "",
                 "vcf_variants": _count_vcf_variants(vcf_file),
+                "vcf_status": vcf_status,
                 "ancient_pca_note": (
                     "use final dedup BAM for pseudo-haploid cohort PCA; "
                     "single-sample HaplotypeCaller VCF is not PCA input"
@@ -534,6 +543,10 @@ def _run_or_reuse_haplotypecaller(
     return vcf_file
 
 
+def _should_skip_vcf(config: PipelineConfig) -> bool:
+    return bool(getattr(config.args, "skip_vcf", False))
+
+
 # ============================================================
 # サンプル単位の解析関数
 # ============================================================
@@ -549,7 +562,8 @@ def process_sample(
     1 サンプル分の解析パイプラインを実行する。
 
     各ランを独立にマッピング → ソフトクリップ → CleanSam し、
-    その後サンプル単位でマージ → 重複除去 → QC → VCF を行う。
+    その後サンプル単位でマージ → 重複除去 → QC を行う。
+    --skip-vcf がない場合は sample ごとの HaplotypeCaller VCF も出力する。
 
     Returns
     -------
@@ -568,10 +582,11 @@ def process_sample(
     bam_processor = BAMProcessor(config)
     mapdamage_analyzer = MapDamageAnalyzer(config)
     qualimap_analyzer = QualimapAnalyzer(config)
-    haplotypecaller = HaplotypeCaller(config)
+    skip_vcf = _should_skip_vcf(config)
+    haplotypecaller = None if skip_vcf else HaplotypeCaller(config)
 
-    # ステップ数: ラン単位 3 ステップ × N ラン + サンプル単位 4 ステップ
-    total_steps = 3 * len(runs) + 4
+    # ステップ数: ラン単位 3 ステップ × N ラン + サンプル単位 3 or 4 ステップ
+    total_steps = 3 * len(runs) + (3 if skip_vcf else 4)
     current_step = 0
     if dashboard is not None:
         dashboard.start_sample(sample_acc, total_steps, "FASTQ  %d runs" % len(runs))
@@ -722,17 +737,20 @@ def process_sample(
             return sample_acc, False, "Qualimap"
 
     # 7. HaplotypeCaller
-    _log_progress("HaplotypeCaller")
-    vcf_file = _run_or_reuse_haplotypecaller(
-        haplotypecaller,
-        sample_acc,
-        dedup_bam,
-        config,
-    )
-    if not vcf_file:
-        logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "HaplotypeCaller")
-        return sample_acc, False, "HaplotypeCaller"
+    if skip_vcf:
+        logger.info("HaplotypeCallerをスキップしました (--skip-vcf): %s", sample_acc)
+    else:
+        _log_progress("HaplotypeCaller")
+        vcf_file = _run_or_reuse_haplotypecaller(
+            haplotypecaller,
+            sample_acc,
+            dedup_bam,
+            config,
+        )
+        if not vcf_file:
+            logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "HaplotypeCaller")
+            return sample_acc, False, "HaplotypeCaller"
 
     # 8. チェックポイント (.done) を記録
     done_flag.parent.mkdir(parents=True, exist_ok=True)
@@ -750,7 +768,7 @@ def process_sample_from_dedup_bam(
     dashboard: Optional[AnalysisDashboard] = None,
 ) -> Tuple[str, bool, str]:
     """
-    既存 dedup BAM から QC と VCF 出力のみを実行する。
+    既存 dedup BAM から QC と、必要に応じて VCF 出力を実行する。
 
     FASTQ 由来の前処理は行わず、入力 BAM は削除しない。
     """
@@ -776,9 +794,10 @@ def process_sample_from_dedup_bam(
 
     mapdamage_analyzer = MapDamageAnalyzer(config)
     qualimap_analyzer = QualimapAnalyzer(config)
-    haplotypecaller = HaplotypeCaller(config)
+    skip_vcf = _should_skip_vcf(config)
+    haplotypecaller = None if skip_vcf else HaplotypeCaller(config)
 
-    total_steps = 3
+    total_steps = 2 if skip_vcf else 3
     current_step = 0
     if dashboard is not None:
         dashboard.start_sample(sample_acc, total_steps, "BAM  既存dedup BAM")
@@ -824,17 +843,20 @@ def process_sample_from_dedup_bam(
             _log_failure_hint(sample_acc, "Qualimap")
             return sample_acc, False, "Qualimap"
 
-    _log_progress("HaplotypeCaller")
-    vcf_file = _run_or_reuse_haplotypecaller(
-        haplotypecaller,
-        sample_acc,
-        dedup_bam,
-        config,
-    )
-    if not vcf_file:
-        logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
-        _log_failure_hint(sample_acc, "HaplotypeCaller")
-        return sample_acc, False, "HaplotypeCaller"
+    if skip_vcf:
+        logger.info("HaplotypeCallerをスキップしました (--skip-vcf): %s", sample_acc)
+    else:
+        _log_progress("HaplotypeCaller")
+        vcf_file = _run_or_reuse_haplotypecaller(
+            haplotypecaller,
+            sample_acc,
+            dedup_bam,
+            config,
+        )
+        if not vcf_file:
+            logger.error("HaplotypeCaller に失敗しました: %s", sample_acc)
+            _log_failure_hint(sample_acc, "HaplotypeCaller")
+            return sample_acc, False, "HaplotypeCaller"
 
     done_flag.parent.mkdir(parents=True, exist_ok=True)
     done_flag.touch()
